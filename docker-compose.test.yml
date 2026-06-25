@@ -1,0 +1,38 @@
+# CI-only integration scaffolding. Do NOT use on customer VMs.
+services:
+  mock-hub:
+    image: mccutchen/go-httpbin:v2.11.0
+    container_name: mock-hub
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      - "8081:8080"
+    # Accepts POSTs at /post. For agent tests, point HYPERSTACK_URL to http://host.docker.internal:8081
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    command: ["--web.listen-address=:9100"]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      - "9100:9100"
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: toxiproxy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      - "8474:8474"   # API
+      - "8666:8666"   # example proxy port
+    command: ["-host=0.0.0.0"]

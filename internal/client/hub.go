@@ -1,0 +1,693 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/NexGenCloud/hyperstack-agent/internal/jitter"
+	"github.com/NexGenCloud/hyperstack-agent/internal/metrics"
+	"github.com/NexGenCloud/hyperstack-agent/internal/system"
+)
+
+const (
+	MaxSeriesPerRequest = 1000
+	MaxPendingSeries    = 10000
+	MaxRetryAfter       = 60 * time.Second
+	maxErrorBodyBytes   = 4096
+)
+
+// KeyRefresher returns a fresh raw infrahub key (no "VM " prefix) by re-fetching
+// it from the source of truth (typically the OpenStack metadata service).
+// Implementations should be safe to call concurrently.
+type KeyRefresher func(ctx context.Context) (string, error)
+
+type HubClient struct {
+	HTTP    *http.Client
+	BaseURL string
+	Path    string
+
+	// APIKey holds the full header value (including any "VM " prefix).
+	// Direct access is retained for backward compatibility with existing
+	// call sites; concurrent reads/writes go through apiKeyMu.
+	apiKeyMu sync.RWMutex
+	APIKey   string
+
+	// rawInfrahubKey caches the un-prefixed key so we can detect when a
+	// refresh returned the same (still-bad) credential and avoid hot loops.
+	rawInfrahubKey string
+
+	// KeyRefresher, when non-nil, is invoked on a 401 response. If it
+	// returns a new key, the request is retried once without consuming a
+	// normal retry slot.
+	KeyRefresher KeyRefresher
+	// refreshMu serializes refresh attempts so concurrent collectors
+	// don't all hammer the metadata service on a flood of 401s.
+	refreshMu       sync.Mutex
+	lastRefreshAt   time.Time
+	refreshCooldown time.Duration
+
+	// VM identity for batch request construction (set once at startup)
+	VMName       string
+	InstanceUUID string
+
+	// metrics queue for batching submissions
+	pendingMu         sync.Mutex
+	pending           []metrics.Measure
+	notifyC           chan struct{}
+	samplesSent       int64
+	samplesFailed     int64
+	collectorsRunning int64
+}
+
+func NewHubClient(baseURL string) *HubClient {
+	// Disable keep-alive: agents push at ~0.13 req/s, so the per-request
+	// TCP/TLS setup cost is negligible (~1-2 ms in-cluster). Keep-alive
+	// pins each agent's connection through both haproxy (mode tcp,
+	// roundrobin) and kube-proxy iptables for ~90 s, which causes
+	// gateway-pod load imbalance and amplifies retry storms onto the
+	// already-slow backend. Forcing a fresh connection per request lets
+	// each request (and each retry) re-hash through both L4 LBs.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	// Use a longer dial timeout to handle occasional slow hubs gracefully.
+	transport.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	// Cap time spent waiting for response headers from a slow gateway pod;
+	// the surrounding http.Client.Timeout=30s only covers the full response.
+	transport.ResponseHeaderTimeout = 15 * time.Second
+
+	return &HubClient{
+		HTTP: &http.Client{
+			Timeout:       30 * time.Second,
+			Transport:     transport,
+			CheckRedirect: stripAPIKeyOnCrossHostRedirect,
+		},
+		BaseURL:         baseURL,
+		refreshCooldown: 30 * time.Second,
+		notifyC:         make(chan struct{}, 1),
+	}
+}
+
+func (h *HubClient) WithPath(path string) *HubClient {
+	h.Path = path
+	return h
+}
+
+// SetInfrahubKey stores the raw infrahub key and updates the header value
+// (prefixed with "VM ") used for outgoing requests. Safe for concurrent use.
+// Passing an empty string clears the key.
+func (h *HubClient) SetInfrahubKey(rawKey string) {
+	h.apiKeyMu.Lock()
+	defer h.apiKeyMu.Unlock()
+	h.rawInfrahubKey = rawKey
+	if rawKey == "" {
+		h.APIKey = ""
+		return
+	}
+	h.APIKey = "VM " + rawKey
+}
+
+// getAPIKey returns the current header value under read lock.
+func (h *HubClient) getAPIKey() string {
+	h.apiKeyMu.RLock()
+	defer h.apiKeyMu.RUnlock()
+	return h.APIKey
+}
+
+// getRawInfrahubKey returns the most recently stored raw key.
+func (h *HubClient) getRawInfrahubKey() string {
+	h.apiKeyMu.RLock()
+	defer h.apiKeyMu.RUnlock()
+	return h.rawInfrahubKey
+}
+
+// refreshInfrahubKey invokes KeyRefresher with cooldown + single-flight
+// semantics. It returns true when the stored key changed as a result of the
+// call, false otherwise (no refresher configured, cooldown active, refresher
+// returned the same key, or refresher errored).
+func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) bool {
+	if h.KeyRefresher == nil {
+		return false
+	}
+	h.refreshMu.Lock()
+	defer h.refreshMu.Unlock()
+
+	// If another goroutine already refreshed since we observed the bad key,
+	// adopt its result instead of calling the refresher again.
+	if current := h.getRawInfrahubKey(); current != "" && current != observedRaw {
+		return true
+	}
+
+	if h.refreshCooldown > 0 && !h.lastRefreshAt.IsZero() {
+		if time.Since(h.lastRefreshAt) < h.refreshCooldown {
+			return false
+		}
+	}
+
+	newKey, err := h.KeyRefresher(ctx)
+	h.lastRefreshAt = time.Now()
+	if err != nil {
+		slog.Warn("infrahub key refresh failed", "error", err)
+		return false
+	}
+	if newKey == "" {
+		slog.Warn("infrahub key refresh returned empty key")
+		return false
+	}
+	if newKey == observedRaw {
+		slog.Warn("infrahub key refresh returned the same key; not retrying")
+		return false
+	}
+	h.SetInfrahubKey(newKey)
+	slog.Info("infrahub key refreshed after 401")
+	return true
+}
+
+func (h *HubClient) SetCollectorsRunning(count int64) {
+	atomic.StoreInt64(&h.collectorsRunning, count)
+}
+
+func (h *HubClient) GetCollectorsRunning() int64 {
+	return atomic.LoadInt64(&h.collectorsRunning)
+}
+
+func (h *HubClient) GetSamplesSent() int64 {
+	return atomic.LoadInt64(&h.samplesSent)
+}
+
+func (h *HubClient) GetSamplesFailed() int64 {
+	return atomic.LoadInt64(&h.samplesFailed)
+}
+
+// EnqueueMetrics adds measures to the submission queue for async batching.
+// This is non-blocking; the actual submission is handled by the submit goroutine.
+func (h *HubClient) EnqueueMetrics(measures []metrics.Measure) {
+	if len(measures) == 0 {
+		return
+	}
+	dropped := 0
+	h.pendingMu.Lock()
+	h.pending = append(h.pending, measures...)
+	if len(h.pending) > MaxPendingSeries {
+		dropped = len(h.pending) - MaxPendingSeries
+		h.pending = append([]metrics.Measure(nil), h.pending[dropped:]...)
+	}
+	h.pendingMu.Unlock()
+	if dropped > 0 {
+		atomic.AddInt64(&h.samplesFailed, int64(dropped))
+		slog.Warn("dropped oldest pending samples", "count", dropped, "max_pending_series", MaxPendingSeries)
+	}
+	select {
+	case h.notifyC <- struct{}{}:
+	default:
+	}
+}
+
+// StartSubmitLoop starts the background goroutine that handles batching and
+// submission of enqueued metrics. Should be called once during initialization.
+// Returns a channel that closes when the submit loop exits.
+func (h *HubClient) StartSubmitLoop(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.runSubmitLoop(ctx)
+	}()
+	return done
+}
+
+const (
+	batchingWindow  = 5 * time.Second
+	minRetryBackoff = 1 * time.Second
+	maxRetryBackoff = 60 * time.Second
+	// samples older than this are never submitted
+	// aligns with gateway's max sample age and prom out-of-order window
+	maxSampleAge = 5 * time.Minute
+)
+
+// filterStaleMetrics removes samples older than maxSampleAge from the batch.
+// Returns the filtered batch and the count of dropped stale samples.
+func filterStaleMetrics(batch []metrics.Measure) ([]metrics.Measure, int) {
+	cutoffSec := float64(time.Now().Add(-maxSampleAge).Unix())
+
+	kept := 0
+	for i := range batch {
+		if batch[i].Timestamp >= cutoffSec {
+			batch[kept] = batch[i]
+			kept++
+		}
+	}
+	dropped := len(batch) - kept
+	return batch[:kept], dropped
+}
+
+// runSubmitLoop batches and submits metrics with single-path retry logic.
+// All retries happen in this loop; submitBatch() makes only one attempt per call.
+func (h *HubClient) runSubmitLoop(ctx context.Context) {
+	retryAttempts := 0
+	successesSinceFail := 0 // require 3 successes in a row to fully reset backoff
+
+	for {
+		// Wait until there is something to send
+		h.pendingMu.Lock()
+		hasPending := len(h.pending) > 0
+		h.pendingMu.Unlock()
+
+		if !hasPending {
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.notifyC:
+			}
+			continue
+		}
+
+		// Batching window: allow metrics from other collectors to accumulate
+		// before submitting. Break early if batch reaches 1000 samples or deadline expires.
+		batchingDeadline := time.Now().Add(batchingWindow)
+
+	batchingLoop:
+		for {
+			h.pendingMu.Lock()
+			pendingSize := len(h.pending)
+			h.pendingMu.Unlock()
+
+			// Break if batch is full (1000 samples)
+			if pendingSize >= MaxSeriesPerRequest {
+				break batchingLoop
+			}
+
+			// Check time remaining in window
+			timeRemaining := time.Until(batchingDeadline)
+			if timeRemaining <= 0 {
+				break batchingLoop
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(timeRemaining):
+				break batchingLoop
+			case <-h.notifyC:
+				continue
+			}
+		}
+
+		// Snapshot and deep-copy batch to prevent mutations
+		h.pendingMu.Lock()
+		if len(h.pending) == 0 {
+			h.pendingMu.Unlock()
+			continue
+		}
+		batchSize := len(h.pending)
+		if batchSize > MaxSeriesPerRequest {
+			batchSize = MaxSeriesPerRequest
+		}
+		batch := metrics.DeepCopyMeasures(h.pending[:batchSize])
+		h.pendingMu.Unlock()
+
+		// Sort batch by timestamp (oldest first)
+		sort.Slice(batch, func(i, j int) bool {
+			return batch[i].Timestamp < batch[j].Timestamp
+		})
+
+		// Filter out samples older than maxSampleAge
+		batch, staleCount := filterStaleMetrics(batch)
+		if staleCount > 0 {
+			slog.Info("dropped stale samples", "count", staleCount)
+			atomic.AddInt64(&h.samplesFailed, int64(staleCount))
+		}
+
+		// If all samples were stale, remove batch from queue and continue
+		if len(batch) == 0 {
+			h.pendingMu.Lock()
+			h.pending = h.pending[batchSize:]
+			h.pendingMu.Unlock()
+			continue
+		}
+
+		// Submit once (no internal retries)
+		submitStart := time.Now()
+		retryAfter, err := h.submitBatch(ctx, batch)
+		submitDuration := time.Since(submitStart)
+
+		if err == nil {
+			// Success: remove batch from queue, track success streak
+			h.pendingMu.Lock()
+			h.pending = h.pending[batchSize:]
+			h.pendingMu.Unlock()
+
+			system.SetLastSubmitMs(submitDuration.Milliseconds())
+			successesSinceFail++
+			// Only fully reset backoff after 3 consecutive successes (guards against flakiness)
+			if successesSinceFail >= 3 {
+				retryAttempts = 0
+				successesSinceFail = 0
+			}
+
+			// Drain stale notify so next idle wait is clean
+			select {
+			case <-h.notifyC:
+			default:
+			}
+
+			slog.Info("hub batch submitted", "series", batchSize, "duration_ms", int(submitDuration/time.Millisecond))
+		} else {
+			// Failure: increment failed counter (once per batch, not per retry attempt),
+			// calculate backoff, and retry next iteration. Batch stays in pending queue automatically.
+			atomic.AddInt64(&h.samplesFailed, int64(batchSize))
+			successesSinceFail = 0 // reset success streak on any failure
+
+			var backoff time.Duration
+			if retryAfter > 0 {
+				// Gateway said: wait this long; cap it to avoid remote sleep amplification.
+				backoff = capRetryAfter(retryAfter)
+				slog.Warn("hub batch submit failed, respecting Retry-After",
+					"size", batchSize, "retry_after_sec", int(retryAfter.Seconds()),
+					"capped_backoff_sec", int(backoff.Seconds()),
+					"error", err)
+			} else {
+				// Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...
+				delay := minRetryBackoff * (1 << retryAttempts)
+				if delay > maxRetryBackoff {
+					delay = maxRetryBackoff
+				}
+				// Add random jitter: [0, delay/2].
+				jitterDelay := jitter.Duration(delay / 2)
+				backoff = delay/2 + jitterDelay
+				retryAttempts++
+
+				slog.Warn("hub batch submit failed, backing off",
+					"size", batchSize, "backoff_sec", int(backoff.Seconds()),
+					"attempt", retryAttempts, "error", err)
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				// Retry next iteration
+			}
+		}
+	}
+}
+
+type SubmitRequest struct {
+	Series []metrics.Measure `json:"series"`
+	Name   string            `json:"name,omitempty"`
+	// Keep the wire field as "uuid" for gateway compatibility.
+	InstanceUUID string `json:"uuid,omitempty"`
+}
+
+// parseRetryAfter parses a Retry-After header value per RFC 7231.
+// Returns (duration, true) if parsed successfully, (0, false) otherwise.
+// Supports two formats: delay-seconds (integer) and HTTP-date.
+func parseRetryAfter(header string) (time.Duration, bool) {
+	if header == "" {
+		return 0, false
+	}
+	// Try delay-seconds first (integer number of seconds)
+	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	// Try HTTP-date format
+	if t, err := http.ParseTime(header); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
+
+func capRetryAfter(d time.Duration) time.Duration {
+	if d > MaxRetryAfter {
+		return MaxRetryAfter
+	}
+	return d
+}
+
+// DrainPending attempts to flush all pending metrics before shutdown.
+// Submits batches with short timeouts (no retries), exits when queue empty or context deadline exceeded.
+func (h *HubClient) DrainPending(ctx context.Context) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(10 * time.Second)
+	}
+
+	for {
+		h.pendingMu.Lock()
+		if len(h.pending) == 0 {
+			h.pendingMu.Unlock()
+			slog.Info("pending queue drained successfully")
+			return nil
+		}
+
+		batchSize := len(h.pending)
+		if batchSize > MaxSeriesPerRequest {
+			batchSize = MaxSeriesPerRequest
+		}
+		batch := metrics.DeepCopyMeasures(h.pending[:batchSize])
+		h.pendingMu.Unlock()
+
+		// Sort batch by timestamp (oldest first)
+		sort.Slice(batch, func(i, j int) bool {
+			return batch[i].Timestamp < batch[j].Timestamp
+		})
+
+		// Submit with per-batch timeout (don't retry on drain)
+		submitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := h.submitBatch(submitCtx, batch)
+		cancel()
+
+		if err == nil {
+			// Success: remove from queue
+			h.pendingMu.Lock()
+			h.pending = h.pending[batchSize:]
+			h.pendingMu.Unlock()
+			slog.Debug("drain: batch submitted", "size", batchSize)
+		} else {
+			// Failure: log and skip (don't retry during drain)
+			slog.Warn("drain: batch submit failed, skipping", "size", batchSize, "error", err)
+			h.pendingMu.Lock()
+			h.pending = h.pending[batchSize:]
+			h.pendingMu.Unlock()
+		}
+
+		// Check deadline
+		if time.Now().After(deadline) {
+			h.pendingMu.Lock()
+			remaining := len(h.pending)
+			h.pendingMu.Unlock()
+			if remaining > 0 {
+				slog.Warn("drain deadline exceeded", "remaining_metrics", remaining)
+				return fmt.Errorf("drain timeout: %d metrics not submitted", remaining)
+			}
+			return nil
+		}
+	}
+}
+
+// submitBatch makes a single submission attempt with no retries.
+// Returns (Retry-After duration if provided by server, error).
+// Injects job label into batch copy (no mutation of pending queue).
+func (h *HubClient) submitBatch(ctx context.Context, batch []metrics.Measure) (time.Duration, error) {
+	if len(batch) == 0 {
+		return 0, nil
+	}
+
+	req := SubmitRequest{
+		Series:       batch,
+		Name:         h.VMName,
+		InstanceUUID: h.InstanceUUID,
+	}
+
+	// Inject job label into batch copy (no mutation of pending queue)
+	for i := range req.Series {
+		if req.Series[i].Labels == nil {
+			req.Series[i].Labels = make(map[string]string)
+		}
+		req.Series[i].Labels["job"] = "hyperstack_agent"
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("marshal request: %w", err)
+	}
+
+	if os.Getenv("HYPERSTACK_DEBUG_LOG_PAYLOAD") == "1" {
+		slog.Info("hub submit payload", "bytes", len(body))
+	}
+
+	url := fmt.Sprintf("%s/%s", h.BaseURL, h.Path)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey := h.getAPIKey(); apiKey != "" {
+		httpReq.Header.Set("api-key", apiKey)
+	}
+
+	observedRawKey := h.getRawInfrahubKey()
+	resp, err := h.HTTP.Do(httpReq)
+	if err != nil {
+		return 0, fmt.Errorf("http error: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
+		closeResponseBody(resp, "submit batch 401")
+		httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return 0, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			httpReq.Header.Set("api-key", apiKey)
+		}
+		resp, err = h.HTTP.Do(httpReq)
+		if err != nil {
+			return 0, fmt.Errorf("http error after key refresh: %w", err)
+		}
+	}
+	defer closeResponseBody(resp, "submit batch")
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Success: update samples sent counter
+		atomic.AddInt64(&h.samplesSent, int64(len(batch)))
+		return 0, nil
+	}
+
+	// Failure: extract Retry-After if present
+	retryAfterHeader := resp.Header.Get("Retry-After")
+	retryAfter, _ := parseRetryAfter(retryAfterHeader)
+	retryAfter = capRetryAfter(retryAfter)
+
+	respBody, err := readErrorBody(resp.Body)
+	if err != nil {
+		return retryAfter, fmt.Errorf("http %d; read response body: %w", resp.StatusCode, err)
+	}
+	return retryAfter, fmt.Errorf("http %d: %s", resp.StatusCode, respBody)
+}
+
+// Submit provides backward compatibility for callers (e.g., system.SubmitStartupMetadata)
+// that expect the old Submit(context, path, payload) interface.
+// For metadata submissions, it makes a single POST/PATCH attempt with no retry loop.
+func (h *HubClient) Submit(ctx context.Context, path string, payload any) error {
+	// Convert payload to JSON bytes
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	// For metadata submissions, use the provided path; otherwise use h.Path
+	usePath := path
+	if !strings.Contains(path, "metadata") && h.Path != "" {
+		usePath = h.Path
+	}
+
+	url := fmt.Sprintf("%s/%s", h.BaseURL, usePath)
+
+	// Use PATCH for metadata, POST for metrics
+	method := http.MethodPost
+	if strings.Contains(path, "metadata") {
+		method = http.MethodPatch
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey := h.getAPIKey(); apiKey != "" {
+		httpReq.Header.Set("api-key", apiKey)
+	}
+
+	observedRawKey := h.getRawInfrahubKey()
+	resp, err := h.HTTP.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
+		closeResponseBody(resp, "submit metadata 401")
+		httpReq, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			httpReq.Header.Set("api-key", apiKey)
+		}
+		resp, err = h.HTTP.Do(httpReq)
+		if err != nil {
+			return err
+		}
+	}
+	defer closeResponseBody(resp, "submit metadata")
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+
+	respBody, err := readErrorBody(resp.Body)
+	if err != nil {
+		return fmt.Errorf("http %d; read response body: %w", resp.StatusCode, err)
+	}
+	return fmt.Errorf("http %d: %s", resp.StatusCode, respBody)
+}
+
+func readErrorBody(body io.Reader) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxErrorBodyBytes {
+		return string(data[:maxErrorBodyBytes]) + "... (truncated)", nil
+	}
+	return string(data), nil
+}
+
+func stripAPIKeyOnCrossHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	previous := via[len(via)-1]
+	if !sameURLAuthority(previous.URL, req.URL) {
+		req.Header.Del("api-key")
+	}
+	return nil
+}
+
+func sameURLAuthority(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+func closeResponseBody(resp *http.Response, operation string) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	if err := resp.Body.Close(); err != nil {
+		slog.Debug("response body close failed", "operation", operation, "error", err)
+	}
+}

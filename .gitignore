@@ -1,0 +1,38 @@
+
+# Build artifacts
+bin/
+.tools/
+agent
+!cmd/agent/
+
+# Go build/test outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+sbom*.json
+
+# Vendor (if used)
+vendor/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local release-review notes, not part of the public repo
+/SECURITY-ARCHITECTURE.md
+/ROADMAP.md
+/note.md
+/PUBLIC_RELEASE_REPORT.md
+/*toxiproxy*.md
+
+# Temporary files
+*.tmp
+*.bak
