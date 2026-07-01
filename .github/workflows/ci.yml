@@ -3,12 +3,16 @@ name: CI
 on:
   pull_request:
   push:
+    branches:
+      - "**"
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -17,23 +21,101 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
+          go-version: 1.25
+          cache: true
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./scripts
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+  scan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.ref_type == 'tag'
+    needs: [lint, test]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25
+          cache: true
+
+      - name: Security (gosec)
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+      - name: Vulnerability check (govulncheck)
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: 1.25
+          go-package: ./...
+          repo-checkout: "false"
+
+      - name: Filesystem scan (trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          cache: true
+          exit-code: 1
+          ignore-unfixed: true
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [lint, test, scan]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
           go-version: "1.25.11"
           cache: true
 
-      - name: Install ShellCheck
-        run: |
-          if command -v sudo >/dev/null 2>&1; then
-            apt_cmd="sudo apt-get"
-          else
-            apt_cmd="apt-get"
-          fi
-          $apt_cmd update
-          $apt_cmd install -y shellcheck
-
-      - name: Bootstrap verification tools
-        run: |
-          ./scripts/bootstrap_tools.sh
-          echo "$PWD/.tools/bin" >> "$GITHUB_PATH"
-
-      - name: Verify
-        run: .tools/bin/task verify
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

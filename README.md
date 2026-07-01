@@ -108,6 +108,25 @@ have `task` on your PATH, `task verify` works as well.
 `task release-agent-full` creates linux amd64, linux arm64, static linux amd64,
 and matching `.sha256` files.
 
+## Publishing a Release
+
+Releases are created automatically by CI when a semver tag is pushed. The
+`release` job runs after `lint`, `test`, and `scan` all pass, then uses
+GoReleaser to build the binary and create the GitHub Release.
+
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Tags must match `v[0-9]+.[0-9]+.[0-9]+` (e.g. `v1.2.3`). Tags with a
+pre-release segment (e.g. `v1.2.3-alpha`) are published as pre-releases.
+
+Each release contains:
+
+- `hyperstack-agent_linux_amd64` — raw binary, no archive wrapper
+- `checksums.txt` — SHA-256 checksum
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
