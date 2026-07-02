@@ -3,6 +3,7 @@ package collectors
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/NexGenCloud/hyperstack-agent/internal/jitter"
@@ -21,6 +22,15 @@ type Manager struct {
 	Scheduled []ScheduledCollector
 	// JitterFraction, if >0, adds up to Interval*JitterFraction random delay per tick
 	JitterFraction float64
+	disabled       atomic.Bool
+}
+
+func (m *Manager) SetEnabled(enabled bool) {
+	m.disabled.Store(!enabled)
+}
+
+func (m *Manager) IsEnabled() bool {
+	return !m.disabled.Load()
 }
 
 func (m *Manager) Run(ctx context.Context) error {
@@ -66,9 +76,13 @@ func (m *Manager) Run(ctx context.Context) error {
 						return
 					case <-time.After(perTickJitter):
 					}
-					start := time.Now()
-					slog.Debug("collector tick", "collector", collectorName, "jitter_ms", int(perTickJitter/time.Millisecond))
-					if err := scLocal.Collector.Run(ctx); err != nil && ctx.Err() == nil {
+				start := time.Now()
+				slog.Debug("collector tick", "collector", collectorName, "jitter_ms", int(perTickJitter/time.Millisecond))
+				if !m.IsEnabled() {
+					slog.Debug("collector skipped; metrics disabled", "collector", collectorName)
+					continue
+				}
+				if err := scLocal.Collector.Run(ctx); err != nil && ctx.Err() == nil {
 						slog.Error("collector run error", "collector", collectorName, "error", err)
 					} else {
 						slog.Debug("collector run ok", "collector", collectorName, "duration_ms", int(time.Since(start)/time.Millisecond))
