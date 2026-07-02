@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,6 +30,8 @@ const (
 	MaxRetryAfter       = 60 * time.Second
 	maxErrorBodyBytes   = 4096
 )
+
+var ErrMetricsDisabled = errors.New("metrics disabled for virtual machine")
 
 // KeyRefresher returns a fresh raw infrahub key (no "VM " prefix) by re-fetching
 // it from the source of truth (typically the OpenStack metadata service).
@@ -367,6 +370,20 @@ func (h *HubClient) runSubmitLoop(ctx context.Context) {
 			}
 
 			slog.Info("hub batch submitted", "series", batchSize, "duration_ms", int(submitDuration/time.Millisecond))
+		} else if errors.Is(err, ErrMetricsDisabled) {
+			h.pendingMu.Lock()
+			h.pending = h.pending[batchSize:]
+			h.pendingMu.Unlock()
+
+			successesSinceFail = 0
+			retryAttempts = 0
+
+			select {
+			case <-h.notifyC:
+			default:
+			}
+
+			slog.Info("hub batch dropped; metrics disabled for vm", "size", batchSize, "error", err)
 		} else {
 			// Failure: increment failed counter (once per batch, not per retry attempt),
 			// calculate backoff, and retry next iteration. Batch stays in pending queue automatically.
@@ -412,6 +429,10 @@ type SubmitRequest struct {
 	Name   string            `json:"name,omitempty"`
 	// Keep the wire field as "uuid" for gateway compatibility.
 	InstanceUUID string `json:"uuid,omitempty"`
+}
+
+type VMMetadata struct {
+	MetricsEnabled bool `json:"metrics_enabled"`
 }
 
 // parseRetryAfter parses a Retry-After header value per RFC 7231.
@@ -584,6 +605,9 @@ func (h *HubClient) submitBatch(ctx context.Context, batch []metrics.Measure) (t
 	if err != nil {
 		return retryAfter, fmt.Errorf("http %d; read response body: %w", resp.StatusCode, err)
 	}
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return 0, fmt.Errorf("%w: %s", ErrMetricsDisabled, respBody)
+	}
 	return retryAfter, fmt.Errorf("http %d: %s", resp.StatusCode, respBody)
 }
 
@@ -652,6 +676,58 @@ func (h *HubClient) Submit(ctx context.Context, path string, payload any) error 
 		return fmt.Errorf("http %d; read response body: %w", resp.StatusCode, err)
 	}
 	return fmt.Errorf("http %d: %s", resp.StatusCode, respBody)
+}
+
+func (h *HubClient) GetMetadata(ctx context.Context, uuid string) (*VMMetadata, error) {
+	escapedUUID := url.PathEscape(strings.TrimSpace(uuid))
+	if escapedUUID == "" {
+		return nil, errors.New("metadata uuid is required")
+	}
+
+	reqURL := fmt.Sprintf("%s/api/v1/metadata/%s", strings.TrimRight(h.BaseURL, "/"), escapedUUID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if apiKey := h.getAPIKey(); apiKey != "" {
+		httpReq.Header.Set("api-key", apiKey)
+	}
+
+	observedRawKey := h.getRawInfrahubKey()
+	resp, err := h.HTTP.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
+		closeResponseBody(resp, "get metadata 401")
+		httpReq, err = http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			httpReq.Header.Set("api-key", apiKey)
+		}
+		resp, err = h.HTTP.Do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer closeResponseBody(resp, "get metadata")
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, err := readErrorBody(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("metadata status %d; read response body: %w", resp.StatusCode, err)
+		}
+		return nil, fmt.Errorf("metadata status %d: %s", resp.StatusCode, respBody)
+	}
+
+	var metadata VMMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return nil, err
+	}
+	return &metadata, nil
 }
 
 func readErrorBody(body io.Reader) (string, error) {

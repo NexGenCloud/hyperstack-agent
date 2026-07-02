@@ -1,4 +1,4 @@
-ARG VERSION=dev
+ARG VERSION=0.0.1
 ARG DATE=unknown
 ARG GO_IMAGE=golang:1.25@sha256:995e25c0e1868fa30a57236d5d8c2252b94b8716e53eae5895cd70dcce532cf0
 ARG RUNTIME_IMAGE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
@@ -12,7 +12,11 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.date=${DATE}" -o hyperstack-agent ./cmd/agent
+RUN build_date="${DATE}"; \
+    if [ -z "$build_date" ] || [ "$build_date" = "unknown" ]; then \
+        build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    fi; \
+    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.date=${build_date}" -o hyperstack-agent ./cmd/agent
 
 FROM ${RUNTIME_IMAGE} AS runtime-base
 ARG VERSION

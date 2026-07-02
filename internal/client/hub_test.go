@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -451,6 +452,46 @@ func TestSubmit_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
 	}
 }
 
+func TestGetMetadataReadsMetricsEnabled(t *testing.T) {
+	var gotPath string
+	var gotAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		gotAPIKey = r.Header.Get("api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metrics_enabled":false}`))
+	}))
+	defer srv.Close()
+
+	hc := NewHubClient(srv.URL)
+	hc.SetInfrahubKey("vm-key")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	metadata, err := hc.GetMetadata(ctx, "vm uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v", err)
+	}
+	if metadata.MetricsEnabled {
+		t.Fatal("MetricsEnabled = true, want false")
+	}
+	if gotPath != "/api/v1/metadata/vm%20uuid" {
+		t.Fatalf("path = %q, want escaped metadata path", gotPath)
+	}
+	if gotAPIKey != "VM vm-key" {
+		t.Fatalf("api-key = %q, want VM key header", gotAPIKey)
+	}
+}
+
+func TestGetMetadataRequiresUUID(t *testing.T) {
+	hc := NewHubClient("http://example.test")
+	_, err := hc.GetMetadata(context.Background(), " ")
+	if err == nil {
+		t.Fatal("GetMetadata() error = nil, want uuid error")
+	}
+}
+
 func TestSubmitBatch_StripsAPIKeyOnCrossHostRedirect(t *testing.T) {
 	var targetAPIKey string
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +553,82 @@ func TestSubmitBatch_SuccessUpdatesSamplesSent(t *testing.T) {
 	}
 	if got := hc.GetSamplesSent(); got != 2 {
 		t.Fatalf("samplesSent = %d, want 2", got)
+	}
+}
+
+func TestSubmitBatchMetricsDisabledReturnsSentinel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Metrics aren't enabled for this virtual machine", http.StatusPreconditionFailed)
+	}))
+	defer srv.Close()
+
+	hc := NewHubClient(srv.URL)
+	hc.VMName = "test-vm"
+	hc.InstanceUUID = "test-uuid"
+
+	batch := []metrics.Measure{
+		{MetricID: "m1", Timestamp: 1000, Value: 42.0, Labels: map[string]string{}},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	retryAfter, err := hc.submitBatch(ctx, batch)
+	if !errors.Is(err, ErrMetricsDisabled) {
+		t.Fatalf("submitBatch() error = %v, want ErrMetricsDisabled", err)
+	}
+	if retryAfter != 0 {
+		t.Fatalf("retryAfter = %v, want 0", retryAfter)
+	}
+	if got := hc.GetSamplesSent(); got != 0 {
+		t.Fatalf("samplesSent = %d, want 0", got)
+	}
+}
+
+func TestRunSubmitLoopDropsMetricsDisabledBatch(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		http.Error(w, "Metrics aren't enabled for this virtual machine", http.StatusPreconditionFailed)
+	}))
+	defer srv.Close()
+
+	hc := NewHubClient(srv.URL)
+	hc.VMName = "test-vm"
+	hc.InstanceUUID = "test-uuid"
+	hc.EnqueueMetrics([]metrics.Measure{
+		{MetricID: "m1", Timestamp: float64(time.Now().Unix()), Value: 42.0, Labels: map[string]string{}},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := hc.StartSubmitLoop(ctx)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		hc.pendingMu.Lock()
+		pending := len(hc.pending)
+		hc.pendingMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	hc.pendingMu.Lock()
+	pending := len(hc.pending)
+	hc.pendingMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending queue = %d, want 0", pending)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("submit attempts = %d, want 1", got)
+	}
+	if got := hc.GetSamplesFailed(); got != 0 {
+		t.Fatalf("samplesFailed = %d, want 0", got)
 	}
 }
 
