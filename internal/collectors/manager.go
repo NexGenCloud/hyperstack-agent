@@ -76,13 +76,13 @@ func (m *Manager) Run(ctx context.Context) error {
 						return
 					case <-time.After(perTickJitter):
 					}
-				start := time.Now()
-				slog.Debug("collector tick", "collector", collectorName, "jitter_ms", int(perTickJitter/time.Millisecond))
-				if !m.IsEnabled() {
-					slog.Debug("collector skipped; metrics disabled", "collector", collectorName)
-					continue
-				}
-				if err := scLocal.Collector.Run(ctx); err != nil && ctx.Err() == nil {
+					start := time.Now()
+					slog.Debug("collector tick", "collector", collectorName, "jitter_ms", int(perTickJitter/time.Millisecond))
+					if !m.IsEnabled() {
+						slog.Debug("collector skipped; metrics disabled", "collector", collectorName)
+						continue
+					}
+					if err := scLocal.Collector.Run(ctx); err != nil && ctx.Err() == nil {
 						slog.Error("collector run error", "collector", collectorName, "error", err)
 					} else {
 						slog.Debug("collector run ok", "collector", collectorName, "duration_ms", int(time.Since(start)/time.Millisecond))
