@@ -41,6 +41,20 @@ Build artifacts are written to `bin/`.
 HYPERSTACK_URL="http://localhost:8000" .tools/bin/task run
 ```
 
+## Development
+
+Install [pre-commit](https://pre-commit.com/) then run:
+
+```bash
+pre-commit install
+```
+
+Hooks run automatically on `git commit`. To run them manually:
+
+```bash
+pre-commit run --all-files
+```
+
 ## Scripts
 
 The `scripts/` directory is part of the public release because it shows how the
