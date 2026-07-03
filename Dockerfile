@@ -31,7 +31,7 @@ ENV AGENT_VERSION=${VERSION} \
     AGENT_BUILD_DATE=${DATE} \
     HYPERSTACK_HEALTH_ADDR=127.0.0.1:9100
 
-FROM runtime-base AS agent-host
+FROM runtime-base AS dev
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     busybox \
@@ -40,7 +40,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY scripts /scripts
 RUN chmod 0755 /scripts/*.sh
 USER hyperstack-agent
-CMD ["/scripts/serve.sh"]
+
+CMD ["/usr/local/bin/hyperstack-agent"]
 
 FROM runtime-base AS agent
 USER hyperstack-agent

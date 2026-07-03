@@ -6,31 +6,13 @@ gateway.
 
 ## Install On A VM
 
-Download the public install helper, review it if required by your change-control
-process, then run it with the gateway URL. The helper downloads the agent binary
-from the gateway `/download` endpoint, verifies the `Hyperstack-Agent-Digest`
-SHA-256 header, installs the binary, and creates the systemd service.
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/NexGenCloud/hyperstack-agent/main/scripts/install_agent.sh
-chmod +x install_agent.sh
-sudo ./install_agent.sh https://gateway.example.com
-```
-
-If the gateway requires a VM key to authorize release metadata or downloads,
-provide `INFRAHUB_KEY` in the environment. The key is only sent as an HTTP
-header and is not written to disk or systemd.
+Installation is handled by the Hyperstack platform.
 
 ## Build
 
-Install [Task](https://taskfile.dev/) before running project commands, or run
-`make tools` to install pinned project tools into `.tools/bin`. Equivalent
-`make` targets are also kept for environments that already standardize on Make.
-
 ```bash
-make tools
-.tools/bin/task build-linux-amd64
-.tools/bin/task build-linux-arm64
+task build-linux-amd64
+task build-linux-arm64
 ```
 
 Build artifacts are written to `bin/`.
@@ -38,7 +20,21 @@ Build artifacts are written to `bin/`.
 ## Run Locally
 
 ```bash
-HYPERSTACK_URL="http://localhost:8000" .tools/bin/task run
+HYPERSTACK_URL="http://localhost:8000" task run
+```
+
+## Development
+
+Install [pre-commit](https://pre-commit.com/) then run:
+
+```bash
+pre-commit install
+```
+
+Hooks run automatically on `git commit`. To run them manually:
+
+```bash
+pre-commit run --all-files
 ```
 
 ## Scripts
@@ -77,36 +73,32 @@ The agent is configured through environment variables:
 ## Task Targets
 
 ```bash
-task tools               # install pinned verification tools into .tools/bin
 task build-linux-amd64   # build linux/amd64 binary
 task build-linux-arm64   # build linux/arm64 binary
 task run                 # run agent locally
 task test                # run Go tests
-task lint                # run Go lint checks
-task security            # run gosec checks
-task govulncheck         # run Go vulnerability checks
-task trivy-fs            # run filesystem vulnerability/misconfiguration scan
-task sbom                # generate a local CycloneDX SBOM
-task secrets             # run gitleaks secret scan
-task verify              # run tests, shellcheck, lint, gosec, govulncheck, Trivy, and gitleaks
-task release-agent       # build amd64 binary and checksum
-task release-agent-full  # build amd64, arm64, static amd64, and checksums
+task static              # build a static linux/amd64 binary
+task clean               # remove build artifacts
 ```
 
-The same target names are available through `make`, for example `make tools` and
-`make verify`. The verification targets install and use pinned local tools from
-`.tools/bin` instead of relying on globally installed binaries. If you already
-have `task` on your PATH, `task verify` works as well.
+## Publishing a Release
 
-## Release Artifacts
+Releases are created automatically by CI when a semver tag is pushed. The
+`release` job runs after `test`, `lint`, and `scan` all pass, then uses
+GoReleaser to build the binary and create the GitHub Release.
 
-`task release-agent` creates:
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
 
-- `bin/hyperstack-agent-linux-amd64`
-- `bin/hyperstack-agent-linux-amd64.sha256`
+Tags must match `v[0-9]+.[0-9]+.[0-9]+` (e.g. `v1.2.3`). Tags with a
+pre-release segment (e.g. `v1.2.3-alpha`) are published as pre-releases.
 
-`task release-agent-full` creates linux amd64, linux arm64, static linux amd64,
-and matching `.sha256` files.
+Each release contains:
+
+- `hyperstack-agent_linux_amd64` — raw binary, no archive wrapper
+- `checksums.txt` — SHA-256 checksum
 
 ## License
 
