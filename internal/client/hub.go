@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,7 +31,9 @@ const (
 	maxErrorBodyBytes   = 4096
 )
 
-// KeyRefresher returns a fresh raw infrahub key (no "VM " prefix) by re-fetching
+var ErrMetricsDisabled = errors.New("metrics disabled for virtual machine")
+
+// KeyRefresher returns a fresh raw Hyperstack key (no "VM " prefix) by re-fetching
 // it from the source of truth (typically the OpenStack metadata service).
 // Implementations should be safe to call concurrently.
 type KeyRefresher func(ctx context.Context) (string, error)
@@ -46,9 +49,9 @@ type HubClient struct {
 	apiKeyMu sync.RWMutex
 	APIKey   string
 
-	// rawInfrahubKey caches the un-prefixed key so we can detect when a
+	// rawHyperstackKey caches the un-prefixed key so we can detect when a
 	// refresh returned the same (still-bad) credential and avoid hot loops.
-	rawInfrahubKey string
+	rawHyperstackKey string
 
 	// KeyRefresher, when non-nil, is invoked on a 401 response. If it
 	// returns a new key, the request is retried once without consuming a
@@ -109,13 +112,13 @@ func (h *HubClient) WithPath(path string) *HubClient {
 	return h
 }
 
-// SetInfrahubKey stores the raw infrahub key and updates the header value
+// SetHyperstackKey stores the raw Hyperstack key and updates the header value
 // (prefixed with "VM ") used for outgoing requests. Safe for concurrent use.
 // Passing an empty string clears the key.
-func (h *HubClient) SetInfrahubKey(rawKey string) {
+func (h *HubClient) SetHyperstackKey(rawKey string) {
 	h.apiKeyMu.Lock()
 	defer h.apiKeyMu.Unlock()
-	h.rawInfrahubKey = rawKey
+	h.rawHyperstackKey = rawKey
 	if rawKey == "" {
 		h.APIKey = ""
 		return
@@ -130,18 +133,18 @@ func (h *HubClient) getAPIKey() string {
 	return h.APIKey
 }
 
-// getRawInfrahubKey returns the most recently stored raw key.
-func (h *HubClient) getRawInfrahubKey() string {
+// getRawHyperstackKey returns the most recently stored raw key.
+func (h *HubClient) getRawHyperstackKey() string {
 	h.apiKeyMu.RLock()
 	defer h.apiKeyMu.RUnlock()
-	return h.rawInfrahubKey
+	return h.rawHyperstackKey
 }
 
-// refreshInfrahubKey invokes KeyRefresher with cooldown + single-flight
+// refreshHyperstackKey invokes KeyRefresher with cooldown + single-flight
 // semantics. It returns true when the stored key changed as a result of the
 // call, false otherwise (no refresher configured, cooldown active, refresher
 // returned the same key, or refresher errored).
-func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) bool {
+func (h *HubClient) refreshHyperstackKey(ctx context.Context, observedRaw string) bool {
 	if h.KeyRefresher == nil {
 		return false
 	}
@@ -150,7 +153,7 @@ func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) 
 
 	// If another goroutine already refreshed since we observed the bad key,
 	// adopt its result instead of calling the refresher again.
-	if current := h.getRawInfrahubKey(); current != "" && current != observedRaw {
+	if current := h.getRawHyperstackKey(); current != "" && current != observedRaw {
 		return true
 	}
 
@@ -163,20 +166,52 @@ func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) 
 	newKey, err := h.KeyRefresher(ctx)
 	h.lastRefreshAt = time.Now()
 	if err != nil {
-		slog.Warn("infrahub key refresh failed", "error", err)
+		slog.Warn("Hyperstack key refresh failed", "error", err)
 		return false
 	}
 	if newKey == "" {
-		slog.Warn("infrahub key refresh returned empty key")
+		slog.Warn("Hyperstack key refresh returned empty key")
 		return false
 	}
 	if newKey == observedRaw {
-		slog.Warn("infrahub key refresh returned the same key; not retrying")
+		slog.Warn("Hyperstack key refresh returned the same key; not retrying")
 		return false
 	}
-	h.SetInfrahubKey(newKey)
-	slog.Info("infrahub key refreshed after 401")
+	h.SetHyperstackKey(newKey)
+	slog.Info("Hyperstack key refreshed after 401")
 	return true
+}
+
+// doWithKeyRefresh executes an HTTP request and, if the response is 401 and a
+// key refresh succeeds, rebuilds and retries the request exactly once.
+// buildReq is called up to twice so that POST bodies (which are not replayable
+// from a one-shot reader) can be reconstructed fresh for the retry.
+func (h *HubClient) doWithKeyRefresh(
+	ctx context.Context,
+	buildReq func() (*http.Request, error),
+	operation string,
+) (*http.Response, error) {
+	req, err := buildReq()
+	if err != nil {
+		return nil, err
+	}
+	observedRawKey := h.getRawHyperstackKey()
+	resp, err := h.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && h.refreshHyperstackKey(ctx, observedRawKey) {
+		closeResponseBody(resp, operation+" 401")
+		req, err = buildReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err = h.HTTP.Do(req)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
 }
 
 func (h *HubClient) SetCollectorsRunning(count int64) {
@@ -367,6 +402,15 @@ func (h *HubClient) runSubmitLoop(ctx context.Context) {
 			}
 
 			slog.Info("hub batch submitted", "series", batchSize, "duration_ms", int(submitDuration/time.Millisecond))
+		} else if errors.Is(err, ErrMetricsDisabled) {
+			h.pendingMu.Lock()
+			h.pending = h.pending[batchSize:]
+			h.pendingMu.Unlock()
+
+			successesSinceFail = 0
+			retryAttempts = 0
+
+			slog.Info("hub batch dropped; metrics disabled for vm", "size", batchSize, "error", err)
 		} else {
 			// Failure: increment failed counter (once per batch, not per retry attempt),
 			// calculate backoff, and retry next iteration. Batch stays in pending queue automatically.
@@ -535,37 +579,21 @@ func (h *HubClient) submitBatch(ctx context.Context, batch []metrics.Measure) (t
 		slog.Info("hub submit payload", "bytes", len(body))
 	}
 
-	url := fmt.Sprintf("%s/%s", h.BaseURL, h.Path)
+	reqURL := fmt.Sprintf("%s/%s", h.BaseURL, h.Path)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.getAPIKey(); apiKey != "" {
-		httpReq.Header.Set("api-key", apiKey)
-	}
-
-	observedRawKey := h.getRawInfrahubKey()
-	resp, err := h.HTTP.Do(httpReq)
+	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			r.Header.Set("api-key", apiKey)
+		}
+		return r, nil
+	}, "submit batch")
 	if err != nil {
 		return 0, fmt.Errorf("http error: %w", err)
-	}
-	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
-		closeResponseBody(resp, "submit batch 401")
-		httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return 0, fmt.Errorf("create request: %w", err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		if apiKey := h.getAPIKey(); apiKey != "" {
-			httpReq.Header.Set("api-key", apiKey)
-		}
-		resp, err = h.HTTP.Do(httpReq)
-		if err != nil {
-			return 0, fmt.Errorf("http error after key refresh: %w", err)
-		}
 	}
 	defer closeResponseBody(resp, "submit batch")
 
@@ -575,14 +603,19 @@ func (h *HubClient) submitBatch(ctx context.Context, batch []metrics.Measure) (t
 		return 0, nil
 	}
 
+	respBody, readErr := readErrorBody(resp.Body)
+
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return 0, fmt.Errorf("%w: %s", ErrMetricsDisabled, respBody)
+	}
+
 	// Failure: extract Retry-After if present
 	retryAfterHeader := resp.Header.Get("Retry-After")
 	retryAfter, _ := parseRetryAfter(retryAfterHeader)
 	retryAfter = capRetryAfter(retryAfter)
 
-	respBody, err := readErrorBody(resp.Body)
-	if err != nil {
-		return retryAfter, fmt.Errorf("http %d; read response body: %w", resp.StatusCode, err)
+	if readErr != nil {
+		return retryAfter, fmt.Errorf("http %d; read response body: %w", resp.StatusCode, readErr)
 	}
 	return retryAfter, fmt.Errorf("http %d: %s", resp.StatusCode, respBody)
 }
@@ -603,7 +636,7 @@ func (h *HubClient) Submit(ctx context.Context, path string, payload any) error 
 		usePath = h.Path
 	}
 
-	url := fmt.Sprintf("%s/%s", h.BaseURL, usePath)
+	reqURL := fmt.Sprintf("%s/%s", h.BaseURL, usePath)
 
 	// Use PATCH for metadata, POST for metrics
 	method := http.MethodPost
@@ -611,35 +644,19 @@ func (h *HubClient) Submit(ctx context.Context, path string, payload any) error 
 		method = http.MethodPatch
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.getAPIKey(); apiKey != "" {
-		httpReq.Header.Set("api-key", apiKey)
-	}
-
-	observedRawKey := h.getRawInfrahubKey()
-	resp, err := h.HTTP.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
-		closeResponseBody(resp, "submit metadata 401")
-		httpReq, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
+	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, method, reqURL, bytes.NewReader(b))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Content-Type", "application/json")
 		if apiKey := h.getAPIKey(); apiKey != "" {
-			httpReq.Header.Set("api-key", apiKey)
+			r.Header.Set("api-key", apiKey)
 		}
-		resp, err = h.HTTP.Do(httpReq)
-		if err != nil {
-			return err
-		}
+		return r, nil
+	}, "submit metadata")
+	if err != nil {
+		return err
 	}
 	defer closeResponseBody(resp, "submit metadata")
 
@@ -690,4 +707,53 @@ func closeResponseBody(resp *http.Response, operation string) {
 	if err := resp.Body.Close(); err != nil {
 		slog.Debug("response body close failed", "operation", operation, "error", err)
 	}
+}
+
+// VMMetadata holds VM-level configuration returned by the gateway.
+//
+// Fix 7a: MetricsEnabled is a *bool rather than a plain bool so that a missing
+// JSON field is distinguishable from an explicit false. A nil value means the
+// gateway did not set the field (e.g. during a rollout or a response mismatch)
+// and callers should treat it as "default-enabled". A plain bool would make a
+// dropped field silently disable all collectors.
+type VMMetadata struct {
+	MetricsEnabled *bool `json:"metrics_enabled"`
+}
+
+func (h *HubClient) GetMetadata(ctx context.Context, uuid string) (*VMMetadata, error) {
+	escapedUUID := url.PathEscape(strings.TrimSpace(uuid))
+	if escapedUUID == "" {
+		return nil, errors.New("metadata uuid is required")
+	}
+
+	reqURL := fmt.Sprintf("%s/api/v1/metadata/%s", strings.TrimRight(h.BaseURL, "/"), escapedUUID)
+
+	// Fix 7b: mirror the refresh-and-retry pattern used by SubmitBatch and
+	// Submit so that a rotated Hyperstack key does not leave the sync loop stuck
+	// on 401 and permanently unable to re-enable collection.
+	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			r.Header.Set("api-key", apiKey)
+		}
+		return r, nil
+	}, "get metadata")
+	if err != nil {
+		return nil, err
+	}
+	defer closeResponseBody(resp, "get metadata")
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := readErrorBody(resp.Body)
+		return nil, fmt.Errorf("metadata status %d: %s", resp.StatusCode, respBody)
+	}
+
+	var metadata VMMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return nil, err
+	}
+	return &metadata, nil
 }

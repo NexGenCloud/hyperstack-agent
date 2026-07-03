@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 	"github.com/NexGenCloud/hyperstack-agent/internal/config"
 	"github.com/NexGenCloud/hyperstack-agent/internal/probes"
 	"github.com/NexGenCloud/hyperstack-agent/internal/system"
+	"github.com/NexGenCloud/hyperstack-agent/internal/update"
 )
 
 var (
@@ -21,12 +26,20 @@ var (
 )
 
 const (
+	autoUpdateInterval            = time.Hour
+	autoUpdateValidationTimeout   = 2 * time.Minute
+	metricsConfigSyncInterval     = time.Minute
+	metricsConfigSyncTimeout      = 10 * time.Second
 	startupMetadataInitialBackoff = 500 * time.Millisecond
 	startupMetadataMaxBackoff     = 1 * time.Minute
 	defaultHealthAddr             = "127.0.0.1:9100"
 )
 
 func main() {
+	if handled, code := runDiagnosticCommand(os.Args[1:], os.Stdout); handled {
+		os.Exit(code)
+	}
+
 	// Configure log level from environment (HYPERSTACK_LOG_LEVEL or LOG_LEVEL)
 	logLevel := slog.LevelInfo
 	for _, key := range []string{"HYPERSTACK_LOG_LEVEL", "LOG_LEVEL"} {
@@ -50,8 +63,11 @@ func main() {
 
 	slog.Info("Hyperstack agent starting", "version", version)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalCh)
 
 	// Load configuration from environment
 	cfg := config.Load()
@@ -60,7 +76,7 @@ func main() {
 		slog.Warn("security configuration warning", "code", warning.Code, "message", warning.Message)
 	}
 
-	// Load startup metadata (uuid, infrahub_key, vm name, etc.) from metadata service once
+	// Load startup metadata (uuid, hyperstack key, vm name, etc.) from metadata service once
 	// Retry with exponential backoff if metadata service is unavailable
 	var meta system.StartupMetadata
 	var err error
@@ -101,13 +117,13 @@ func main() {
 
 	// Hub client with API key from startup metadata. A KeyRefresher is
 	// installed so that gateway 401 responses (e.g. after key rotation in
-	// infrahub) trigger a one-shot re-fetch from the metadata service
+	// Hyperstack) trigger a one-shot re-fetch from the metadata service
 	// rather than burning the agent's retry budget on a stale credential.
 	hub := client.NewHubClient(cfg.Hub.URL).
 		WithPath(config.AgentPushPath)
-	hub.KeyRefresher = system.FetchInfrahubKey
-	if meta.InfrahubKey != "" {
-		hub.SetInfrahubKey(meta.InfrahubKey)
+	hub.KeyRefresher = system.FetchHyperstackKey
+	if meta.HyperstackKey != "" {
+		hub.SetHyperstackKey(meta.HyperstackKey)
 	}
 
 	var scheduled []collectors.ScheduledCollector
@@ -170,23 +186,229 @@ func main() {
 	submitLoopDone := hub.StartSubmitLoop(ctx)
 
 	mgr := &collectors.Manager{Scheduled: scheduled}
-	if err := mgr.Run(ctx); err != nil && err != context.Canceled {
-		slog.Error("manager exited", "error", err)
-		os.Exit(1)
+	if meta.UUID == "" {
+		slog.Warn("metrics enablement sync disabled; instance uuid unavailable")
+	} else {
+		// Fix 6: do NOT pre-disable collectors before the first sync. The old
+		// behaviour was to always collect; defaulting to enabled until we receive
+		// an explicit false from the gateway preserves that contract. Starting
+		// disabled is risky: any first-sync failure (network blip, missing field,
+		// gateway rollout) would leave collectors permanently off.
+		go runMetricsEnabledSyncLoop(ctx, hub, mgr, meta.UUID, len(scheduled), metricsConfigSyncInterval)
 	}
 
-	// Wait for submit loop to exit before draining (prevents double-submission on shutdown)
-	slog.Info("collectors stopped, waiting for submit loop to exit")
-	<-submitLoopDone
+	managerErrCh := make(chan error, 1)
+	go func() {
+		managerErrCh <- mgr.Run(ctx)
+	}()
 
-	// Collectors have exited and submit loop has stopped, now drain any remaining metrics
-	slog.Info("submit loop exited, draining pending metrics")
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer drainCancel()
-
-	if err := hub.DrainPending(drainCtx); err != nil {
-		slog.Warn("drain error", "error", err)
+	updateReadyCh := make(chan *update.Release, 1)
+	var executablePath string
+	var updater *update.Manager
+	currentPath, err := os.Executable()
+	if err != nil {
+		slog.Warn("self-update disabled; unable to resolve current executable", "error", err)
+	} else {
+		executablePath = currentPath
+		updateCheckURL := strings.TrimRight(cfg.Hub.URL, "/") + "/download"
+		updater = update.NewManager(updateCheckURL, version)
+		go runSelfUpdateLoop(ctx, updater, currentPath, autoUpdateInterval, updateReadyCh)
 	}
 
-	slog.Info("Hyperstack agent shutdown complete")
+	var restartRelease *update.Release
+	externalShutdown := false
+	for {
+		select {
+		case sig := <-signalCh:
+			externalShutdown = true
+			slog.Info("shutdown signal received", "signal", sig)
+			cancel()
+		case err := <-managerErrCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("manager exited", "error", err)
+				os.Exit(1)
+			}
+
+			// Wait for submit loop to exit before draining (prevents double-submission on shutdown)
+			slog.Info("collectors stopped, waiting for submit loop to exit")
+			<-submitLoopDone
+
+			// Collectors have exited and submit loop has stopped, now drain any remaining metrics
+			slog.Info("submit loop exited, draining pending metrics")
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := hub.DrainPending(drainCtx); err != nil {
+				slog.Warn("drain error", "error", err)
+			}
+			drainCancel()
+
+			select {
+			case sig := <-signalCh:
+				externalShutdown = true
+				slog.Info("shutdown signal received", "signal", sig)
+			default:
+			}
+
+			if restartRelease != nil && updater != nil && !externalShutdown {
+				if err := updater.PromoteRelease(executablePath, restartRelease); err != nil {
+					slog.Error("self-update promote failed", "version", restartRelease.Version, "error", err)
+					os.Exit(1)
+				}
+				slog.Info("restarting agent after self-update", "version", restartRelease.Version)
+				if err := update.RestartProcess(executablePath); err != nil {
+					slog.Error("self-update restart failed", "error", err)
+					os.Exit(1)
+				}
+			} else if restartRelease != nil {
+				_ = os.Remove(restartRelease.StagedPath)
+				if externalShutdown {
+					slog.Info("self-update skipped because shutdown was requested", "version", restartRelease.Version)
+				}
+			}
+			slog.Info("Hyperstack agent shutdown complete")
+			return
+		case release := <-updateReadyCh:
+			if release == nil || restartRelease != nil {
+				continue
+			}
+			restartRelease = release
+			slog.Info("self-update prepared; stopping collectors for restart", "version", release.Version)
+			cancel()
+		}
+	}
+}
+
+func runMetricsEnabledSyncLoop(
+	ctx context.Context,
+	hub *client.HubClient,
+	manager *collectors.Manager,
+	uuid string,
+	collectorCount int,
+	interval time.Duration,
+) {
+	if interval <= 0 {
+		interval = metricsConfigSyncInterval
+	}
+
+	lastEnabled := true
+	hasLastEnabled := false
+	sync := func() {
+		syncCtx, cancel := context.WithTimeout(ctx, metricsConfigSyncTimeout)
+		metadata, err := hub.GetMetadata(syncCtx, uuid)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("metrics enablement sync failed", "uuid", uuid, "error", err)
+			return
+		}
+
+		// Fix 7a: MetricsEnabled is *bool; nil means the field was absent from
+		// the response (gateway rollout, mismatch). Treat nil as default-enabled
+		// so a missing field never silently turns off all collectors.
+		enabled := metadata.MetricsEnabled == nil || *metadata.MetricsEnabled
+		manager.SetEnabled(enabled)
+		if enabled {
+			hub.SetCollectorsRunning(int64(collectorCount))
+		} else {
+			hub.SetCollectorsRunning(0)
+		}
+
+		if !hasLastEnabled || lastEnabled != enabled {
+			if enabled {
+				slog.Info("metrics enabled; collectors resumed", "uuid", uuid)
+			} else {
+				slog.Info("metrics disabled; collectors sleeping", "uuid", uuid)
+			}
+			lastEnabled = enabled
+			hasLastEnabled = true
+		}
+	}
+
+	sync()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sync()
+		}
+	}
+}
+
+func runDiagnosticCommand(args []string, stdout io.Writer) (bool, int) {
+	if len(args) == 0 {
+		return false, 0
+	}
+
+	switch args[0] {
+	case "version", "--version", "-version":
+		_, _ = fmt.Fprintln(stdout, version)
+		return true, 0
+	case "diagnose":
+		if len(args) == 2 && args[1] == "status" {
+			_, _ = fmt.Fprintf(stdout, "status=ok version=%s date=%s\n", version, date)
+			return true, 0
+		}
+		_, _ = fmt.Fprintln(stdout, "usage: hyperstack-agent diagnose status")
+		return true, 2
+	default:
+		return false, 0
+	}
+}
+
+func runSelfUpdateLoop(
+	ctx context.Context,
+	updater *update.Manager,
+	currentPath string,
+	interval time.Duration,
+	updateReadyCh chan<- *update.Release,
+) {
+	check := func() {
+		release, err := updater.Check(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("self-update check failed", "url", updater.CheckURL, "error", err)
+			return
+		}
+		if release == nil {
+			return
+		}
+		slog.Info("new agent version available", "current_version", updater.CurrentVersion, "available_version", release.Version)
+		validationCtx, validationCancel := context.WithTimeout(context.Background(), autoUpdateValidationTimeout)
+		err = updater.DownloadRelease(validationCtx, release, currentPath)
+		validationCancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("self-update download failed", "version", release.Version, "error", err)
+			return
+		}
+		if ctx.Err() != nil {
+			_ = os.Remove(release.StagedPath)
+			return
+		}
+		select {
+		case updateReadyCh <- release:
+		default:
+			_ = os.Remove(release.StagedPath)
+		}
+	}
+
+	check()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
 }
