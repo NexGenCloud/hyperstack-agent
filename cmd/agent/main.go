@@ -76,7 +76,7 @@ func main() {
 		slog.Warn("security configuration warning", "code", warning.Code, "message", warning.Message)
 	}
 
-	// Load startup metadata (uuid, infrahub_key, vm name, etc.) from metadata service once
+	// Load startup metadata (uuid, hyperstack key, vm name, etc.) from metadata service once
 	// Retry with exponential backoff if metadata service is unavailable
 	var meta system.StartupMetadata
 	var err error
@@ -117,13 +117,13 @@ func main() {
 
 	// Hub client with API key from startup metadata. A KeyRefresher is
 	// installed so that gateway 401 responses (e.g. after key rotation in
-	// infrahub) trigger a one-shot re-fetch from the metadata service
+	// Hyperstack) trigger a one-shot re-fetch from the metadata service
 	// rather than burning the agent's retry budget on a stale credential.
 	hub := client.NewHubClient(cfg.Hub.URL).
 		WithPath(config.AgentPushPath)
-	hub.KeyRefresher = system.FetchInfrahubKey
-	if meta.InfrahubKey != "" {
-		hub.SetInfrahubKey(meta.InfrahubKey)
+	hub.KeyRefresher = system.FetchHyperstackKey
+	if meta.HyperstackKey != "" {
+		hub.SetHyperstackKey(meta.HyperstackKey)
 	}
 
 	var scheduled []collectors.ScheduledCollector

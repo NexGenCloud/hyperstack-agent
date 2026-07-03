@@ -33,7 +33,7 @@ const (
 
 var ErrMetricsDisabled = errors.New("metrics disabled for virtual machine")
 
-// KeyRefresher returns a fresh raw infrahub key (no "VM " prefix) by re-fetching
+// KeyRefresher returns a fresh raw Hyperstack key (no "VM " prefix) by re-fetching
 // it from the source of truth (typically the OpenStack metadata service).
 // Implementations should be safe to call concurrently.
 type KeyRefresher func(ctx context.Context) (string, error)
@@ -49,9 +49,9 @@ type HubClient struct {
 	apiKeyMu sync.RWMutex
 	APIKey   string
 
-	// rawInfrahubKey caches the un-prefixed key so we can detect when a
+	// rawHyperstackKey caches the un-prefixed key so we can detect when a
 	// refresh returned the same (still-bad) credential and avoid hot loops.
-	rawInfrahubKey string
+	rawHyperstackKey string
 
 	// KeyRefresher, when non-nil, is invoked on a 401 response. If it
 	// returns a new key, the request is retried once without consuming a
@@ -112,13 +112,13 @@ func (h *HubClient) WithPath(path string) *HubClient {
 	return h
 }
 
-// SetInfrahubKey stores the raw infrahub key and updates the header value
+// SetHyperstackKey stores the raw Hyperstack key and updates the header value
 // (prefixed with "VM ") used for outgoing requests. Safe for concurrent use.
 // Passing an empty string clears the key.
-func (h *HubClient) SetInfrahubKey(rawKey string) {
+func (h *HubClient) SetHyperstackKey(rawKey string) {
 	h.apiKeyMu.Lock()
 	defer h.apiKeyMu.Unlock()
-	h.rawInfrahubKey = rawKey
+	h.rawHyperstackKey = rawKey
 	if rawKey == "" {
 		h.APIKey = ""
 		return
@@ -133,18 +133,18 @@ func (h *HubClient) getAPIKey() string {
 	return h.APIKey
 }
 
-// getRawInfrahubKey returns the most recently stored raw key.
-func (h *HubClient) getRawInfrahubKey() string {
+// getRawHyperstackKey returns the most recently stored raw key.
+func (h *HubClient) getRawHyperstackKey() string {
 	h.apiKeyMu.RLock()
 	defer h.apiKeyMu.RUnlock()
-	return h.rawInfrahubKey
+	return h.rawHyperstackKey
 }
 
-// refreshInfrahubKey invokes KeyRefresher with cooldown + single-flight
+// refreshHyperstackKey invokes KeyRefresher with cooldown + single-flight
 // semantics. It returns true when the stored key changed as a result of the
 // call, false otherwise (no refresher configured, cooldown active, refresher
 // returned the same key, or refresher errored).
-func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) bool {
+func (h *HubClient) refreshHyperstackKey(ctx context.Context, observedRaw string) bool {
 	if h.KeyRefresher == nil {
 		return false
 	}
@@ -153,7 +153,7 @@ func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) 
 
 	// If another goroutine already refreshed since we observed the bad key,
 	// adopt its result instead of calling the refresher again.
-	if current := h.getRawInfrahubKey(); current != "" && current != observedRaw {
+	if current := h.getRawHyperstackKey(); current != "" && current != observedRaw {
 		return true
 	}
 
@@ -166,19 +166,19 @@ func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) 
 	newKey, err := h.KeyRefresher(ctx)
 	h.lastRefreshAt = time.Now()
 	if err != nil {
-		slog.Warn("infrahub key refresh failed", "error", err)
+		slog.Warn("Hyperstack key refresh failed", "error", err)
 		return false
 	}
 	if newKey == "" {
-		slog.Warn("infrahub key refresh returned empty key")
+		slog.Warn("Hyperstack key refresh returned empty key")
 		return false
 	}
 	if newKey == observedRaw {
-		slog.Warn("infrahub key refresh returned the same key; not retrying")
+		slog.Warn("Hyperstack key refresh returned the same key; not retrying")
 		return false
 	}
-	h.SetInfrahubKey(newKey)
-	slog.Info("infrahub key refreshed after 401")
+	h.SetHyperstackKey(newKey)
+	slog.Info("Hyperstack key refreshed after 401")
 	return true
 }
 
@@ -195,12 +195,12 @@ func (h *HubClient) doWithKeyRefresh(
 	if err != nil {
 		return nil, err
 	}
-	observedRawKey := h.getRawInfrahubKey()
+	observedRawKey := h.getRawHyperstackKey()
 	resp, err := h.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
+	if resp.StatusCode == http.StatusUnauthorized && h.refreshHyperstackKey(ctx, observedRawKey) {
 		closeResponseBody(resp, operation+" 401")
 		req, err = buildReq()
 		if err != nil {
@@ -729,7 +729,7 @@ func (h *HubClient) GetMetadata(ctx context.Context, uuid string) (*VMMetadata, 
 	reqURL := fmt.Sprintf("%s/api/v1/metadata/%s", strings.TrimRight(h.BaseURL, "/"), escapedUUID)
 
 	// Fix 7b: mirror the refresh-and-retry pattern used by SubmitBatch and
-	// Submit so that a rotated infrahub key does not leave the sync loop stuck
+	// Submit so that a rotated Hyperstack key does not leave the sync loop stuck
 	// on 401 and permanently unable to re-enable collection.
 	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
 		r, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)

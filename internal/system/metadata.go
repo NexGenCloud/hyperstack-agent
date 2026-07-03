@@ -304,18 +304,18 @@ func metadataMetaString(data map[string]any, key string) string {
 
 // StartupMetadata holds essential identity and auth data loaded once at startup.
 type StartupMetadata struct {
-	UUID        string
-	InfrahubKey string
-	VMName      string
-	Cluster     string
-	Role        string
+	UUID          string
+	HyperstackKey string
+	VMName        string
+	Cluster       string
+	Role          string
 }
 
-// FetchInfrahubKey re-fetches the metadata from HTTP (skipping the cloud-init file)
+// FetchHyperstackKey re-fetches the metadata from HTTP (skipping the cloud-init file)
 // and returns the `meta.infrahub_key` value. Used to recover from gateway 401s when
 // the originally-cached key has been rotated. The returned key is the raw value
 // (no "VM " prefix).
-func FetchInfrahubKey(ctx context.Context) (string, error) {
+func FetchHyperstackKey(ctx context.Context) (string, error) {
 	// Honor caller cancellation by running the (synchronous) fetch in a
 	// goroutine and selecting on ctx.Done(). The underlying fetch already
 	// imposes its own per-request timeout.
@@ -352,11 +352,11 @@ func LoadStartupMetadata() (StartupMetadata, error) {
 	}
 
 	meta := StartupMetadata{
-		UUID:        metadataString(metadata, "uuid"),
-		InfrahubKey: metadataMetaString(metadata, "infrahub_key"),
-		VMName:      metadataString(metadata, "name"),
-		Cluster:     metadataMetaString(metadata, "cluster"),
-		Role:        metadataMetaString(metadata, "role"),
+		UUID:          metadataString(metadata, "uuid"),
+		HyperstackKey: metadataMetaString(metadata, "infrahub_key"),
+		VMName:        metadataString(metadata, "name"),
+		Cluster:       metadataMetaString(metadata, "cluster"),
+		Role:          metadataMetaString(metadata, "role"),
 	}
 
 	if meta.VMName == "" {

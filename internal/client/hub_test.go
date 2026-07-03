@@ -345,7 +345,7 @@ func TestSubmitBatch_SingleAttemptNoRetry(t *testing.T) {
 	}
 }
 
-func TestSubmitBatch_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
+func TestSubmitBatch_RefreshesHyperstackKeyOnUnauthorized(t *testing.T) {
 	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempt := attempts.Add(1)
@@ -373,7 +373,7 @@ func TestSubmitBatch_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
 	hc := NewHubClient(srv.URL)
 	hc.VMName = "test-vm"
 	hc.InstanceUUID = "test-uuid"
-	hc.SetInfrahubKey("stale-key")
+	hc.SetHyperstackKey("stale-key")
 	hc.KeyRefresher = func(ctx context.Context) (string, error) {
 		refreshes.Add(1)
 		return "fresh-key", nil
@@ -401,7 +401,7 @@ func TestSubmitBatch_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
 	}
 }
 
-func TestSubmit_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
+func TestSubmit_RefreshesHyperstackKeyOnUnauthorized(t *testing.T) {
 	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {
@@ -430,7 +430,7 @@ func TestSubmit_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
 
 	var refreshes atomic.Int32
 	hc := NewHubClient(srv.URL)
-	hc.SetInfrahubKey("stale-key")
+	hc.SetHyperstackKey("stale-key")
 	hc.KeyRefresher = func(ctx context.Context) (string, error) {
 		refreshes.Add(1)
 		return "fresh-key", nil
@@ -470,7 +470,7 @@ func TestSubmitBatch_StripsAPIKeyOnCrossHostRedirect(t *testing.T) {
 	hc := NewHubClient(redirector.URL)
 	hc.VMName = "test-vm"
 	hc.InstanceUUID = "test-uuid"
-	hc.SetInfrahubKey("secret-key")
+	hc.SetHyperstackKey("secret-key")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1004,10 +1004,10 @@ func TestGetMetadata_MissingFieldIsNil(t *testing.T) {
 	}
 }
 
-// TestGetMetadata_RefreshesInfrahubKeyOnUnauthorized verifies that GetMetadata
+// TestGetMetadata_RefreshesHyperstackKeyOnUnauthorized verifies that GetMetadata
 // retries the request after a 401 triggers a successful key refresh
 // (mirrors the same test pattern used for SubmitBatch and Submit).
-func TestGetMetadata_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
+func TestGetMetadata_RefreshesHyperstackKeyOnUnauthorized(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -1021,7 +1021,7 @@ func TestGetMetadata_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
 	defer server.Close()
 
 	h := NewHubClient(server.URL)
-	h.SetInfrahubKey("old-key")
+	h.SetHyperstackKey("old-key")
 	h.KeyRefresher = func(_ context.Context) (string, error) {
 		return "new-key", nil
 	}
