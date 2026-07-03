@@ -23,6 +23,41 @@ Build artifacts are written to `bin/`.
 HYPERSTACK_URL="http://localhost:8000" task run
 ```
 
+## Development
+
+Install [pre-commit](https://pre-commit.com/) then run:
+
+```bash
+pre-commit install
+```
+
+Hooks run automatically on `git commit`. To run them manually:
+
+```bash
+pre-commit run --all-files
+```
+
+## Scripts
+
+The `scripts/` directory is part of the public release because it shows how the
+agent is built, installed, tested, and removed.
+
+- `scripts/install_agent.sh`: VM install helper. Requires a gateway URL argument
+  or `GATEWAY_URL`; optionally sends `INFRAHUB_KEY` as a download authorization
+  header without persisting it.
+- `scripts/install.sh`: advanced systemd installer for a local agent binary.
+  Requires `BINARY_SOURCE` and does not embed credentials.
+- `scripts/uninstall_agent.sh`: removes the systemd service and agent runtime
+  files.
+- `scripts/build.sh`: builds linux release artifacts and SHA-256 checksums.
+- `scripts/serve.sh`: local Docker helper that serves `/download` and
+  `/version` for install/update tests.
+- `scripts/e2e.sh`: local Docker end-to-end test helper.
+
+Do not commit `.env` files, real gateway URLs, private IPs, credentials, tokens,
+or customer-specific metadata into this repository. Use placeholders such as
+`gateway.example.com` in docs and test fixtures.
+
 ## Configuration
 
 The agent is configured through environment variables:
