@@ -23,6 +23,7 @@ vendor/
 Thumbs.db
 .idea/
 .vscode/
+.kilo/
 *.swp
 *.swo
 

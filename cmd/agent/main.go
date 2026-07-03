@@ -189,8 +189,11 @@ func main() {
 	if meta.UUID == "" {
 		slog.Warn("metrics enablement sync disabled; instance uuid unavailable")
 	} else {
-		mgr.SetEnabled(false)
-		hub.SetCollectorsRunning(0)
+		// Fix 6: do NOT pre-disable collectors before the first sync. The old
+		// behaviour was to always collect; defaulting to enabled until we receive
+		// an explicit false from the gateway preserves that contract. Starting
+		// disabled is risky: any first-sync failure (network blip, missing field,
+		// gateway rollout) would leave collectors permanently off.
 		go runMetricsEnabledSyncLoop(ctx, hub, mgr, meta.UUID, len(scheduled), metricsConfigSyncInterval)
 	}
 
@@ -300,7 +303,10 @@ func runMetricsEnabledSyncLoop(
 			return
 		}
 
-		enabled := metadata.MetricsEnabled
+		// Fix 7a: MetricsEnabled is *bool; nil means the field was absent from
+		// the response (gateway rollout, mismatch). Treat nil as default-enabled
+		// so a missing field never silently turns off all collectors.
+		enabled := metadata.MetricsEnabled == nil || *metadata.MetricsEnabled
 		manager.SetEnabled(enabled)
 		if enabled {
 			hub.SetCollectorsRunning(int64(collectorCount))

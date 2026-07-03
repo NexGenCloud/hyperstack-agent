@@ -182,6 +182,38 @@ func (h *HubClient) refreshInfrahubKey(ctx context.Context, observedRaw string) 
 	return true
 }
 
+// doWithKeyRefresh executes an HTTP request and, if the response is 401 and a
+// key refresh succeeds, rebuilds and retries the request exactly once.
+// buildReq is called up to twice so that POST bodies (which are not replayable
+// from a one-shot reader) can be reconstructed fresh for the retry.
+func (h *HubClient) doWithKeyRefresh(
+	ctx context.Context,
+	buildReq func() (*http.Request, error),
+	operation string,
+) (*http.Response, error) {
+	req, err := buildReq()
+	if err != nil {
+		return nil, err
+	}
+	observedRawKey := h.getRawInfrahubKey()
+	resp, err := h.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
+		closeResponseBody(resp, operation+" 401")
+		req, err = buildReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err = h.HTTP.Do(req)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
+}
+
 func (h *HubClient) SetCollectorsRunning(count int64) {
 	atomic.StoreInt64(&h.collectorsRunning, count)
 }
@@ -547,37 +579,21 @@ func (h *HubClient) submitBatch(ctx context.Context, batch []metrics.Measure) (t
 		slog.Info("hub submit payload", "bytes", len(body))
 	}
 
-	url := fmt.Sprintf("%s/%s", h.BaseURL, h.Path)
+	reqURL := fmt.Sprintf("%s/%s", h.BaseURL, h.Path)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.getAPIKey(); apiKey != "" {
-		httpReq.Header.Set("api-key", apiKey)
-	}
-
-	observedRawKey := h.getRawInfrahubKey()
-	resp, err := h.HTTP.Do(httpReq)
+	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			r.Header.Set("api-key", apiKey)
+		}
+		return r, nil
+	}, "submit batch")
 	if err != nil {
 		return 0, fmt.Errorf("http error: %w", err)
-	}
-	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
-		closeResponseBody(resp, "submit batch 401")
-		httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return 0, fmt.Errorf("create request: %w", err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		if apiKey := h.getAPIKey(); apiKey != "" {
-			httpReq.Header.Set("api-key", apiKey)
-		}
-		resp, err = h.HTTP.Do(httpReq)
-		if err != nil {
-			return 0, fmt.Errorf("http error after key refresh: %w", err)
-		}
 	}
 	defer closeResponseBody(resp, "submit batch")
 
@@ -620,7 +636,7 @@ func (h *HubClient) Submit(ctx context.Context, path string, payload any) error 
 		usePath = h.Path
 	}
 
-	url := fmt.Sprintf("%s/%s", h.BaseURL, usePath)
+	reqURL := fmt.Sprintf("%s/%s", h.BaseURL, usePath)
 
 	// Use PATCH for metadata, POST for metrics
 	method := http.MethodPost
@@ -628,35 +644,19 @@ func (h *HubClient) Submit(ctx context.Context, path string, payload any) error 
 		method = http.MethodPatch
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.getAPIKey(); apiKey != "" {
-		httpReq.Header.Set("api-key", apiKey)
-	}
-
-	observedRawKey := h.getRawInfrahubKey()
-	resp, err := h.HTTP.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == http.StatusUnauthorized && h.refreshInfrahubKey(ctx, observedRawKey) {
-		closeResponseBody(resp, "submit metadata 401")
-		httpReq, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
+	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, method, reqURL, bytes.NewReader(b))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Content-Type", "application/json")
 		if apiKey := h.getAPIKey(); apiKey != "" {
-			httpReq.Header.Set("api-key", apiKey)
+			r.Header.Set("api-key", apiKey)
 		}
-		resp, err = h.HTTP.Do(httpReq)
-		if err != nil {
-			return err
-		}
+		return r, nil
+	}, "submit metadata")
+	if err != nil {
+		return err
 	}
 	defer closeResponseBody(resp, "submit metadata")
 
@@ -709,8 +709,15 @@ func closeResponseBody(resp *http.Response, operation string) {
 	}
 }
 
+// VMMetadata holds VM-level configuration returned by the gateway.
+//
+// Fix 7a: MetricsEnabled is a *bool rather than a plain bool so that a missing
+// JSON field is distinguishable from an explicit false. A nil value means the
+// gateway did not set the field (e.g. during a rollout or a response mismatch)
+// and callers should treat it as "default-enabled". A plain bool would make a
+// dropped field silently disable all collectors.
 type VMMetadata struct {
-	MetricsEnabled bool `json:"metrics_enabled"`
+	MetricsEnabled *bool `json:"metrics_enabled"`
 }
 
 func (h *HubClient) GetMetadata(ctx context.Context, uuid string) (*VMMetadata, error) {
@@ -720,16 +727,20 @@ func (h *HubClient) GetMetadata(ctx context.Context, uuid string) (*VMMetadata, 
 	}
 
 	reqURL := fmt.Sprintf("%s/api/v1/metadata/%s", strings.TrimRight(h.BaseURL, "/"), escapedUUID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
 
-	if apiKey := h.getAPIKey(); apiKey != "" {
-		httpReq.Header.Set("api-key", apiKey)
-	}
-
-	resp, err := h.HTTP.Do(httpReq)
+	// Fix 7b: mirror the refresh-and-retry pattern used by SubmitBatch and
+	// Submit so that a rotated infrahub key does not leave the sync loop stuck
+	// on 401 and permanently unable to re-enable collection.
+	resp, err := h.doWithKeyRefresh(ctx, func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if apiKey := h.getAPIKey(); apiKey != "" {
+			r.Header.Set("api-key", apiKey)
+		}
+		return r, nil
+	}, "get metadata")
 	if err != nil {
 		return nil, err
 	}

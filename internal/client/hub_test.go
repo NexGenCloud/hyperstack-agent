@@ -940,3 +940,100 @@ func TestDeepCopyMeasures(t *testing.T) {
 		t.Fatalf("copy didn't update: key=%q, want 'modified'", copied[0].Labels["key"])
 	}
 }
+
+// Fix 7a + 7b: GetMetadata tests — *bool semantics and 401 retry.
+
+// TestGetMetadata_ExplicitTrue verifies that metrics_enabled:true is decoded correctly.
+func TestGetMetadata_ExplicitTrue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"metrics_enabled":true}`)
+	}))
+	defer server.Close()
+
+	h := NewHubClient(server.URL)
+	meta, err := h.GetMetadata(context.Background(), "test-uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v", err)
+	}
+	if meta.MetricsEnabled == nil {
+		t.Fatal("MetricsEnabled = nil, want non-nil")
+	}
+	if !*meta.MetricsEnabled {
+		t.Fatal("MetricsEnabled = false, want true")
+	}
+}
+
+// TestGetMetadata_ExplicitFalse verifies that metrics_enabled:false is decoded correctly.
+func TestGetMetadata_ExplicitFalse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"metrics_enabled":false}`)
+	}))
+	defer server.Close()
+
+	h := NewHubClient(server.URL)
+	meta, err := h.GetMetadata(context.Background(), "test-uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v", err)
+	}
+	if meta.MetricsEnabled == nil {
+		t.Fatal("MetricsEnabled = nil, want non-nil")
+	}
+	if *meta.MetricsEnabled {
+		t.Fatal("MetricsEnabled = true, want false")
+	}
+}
+
+// TestGetMetadata_MissingFieldIsNil verifies that a response without
+// metrics_enabled leaves MetricsEnabled as nil (distinguishable from false).
+func TestGetMetadata_MissingFieldIsNil(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{}`)
+	}))
+	defer server.Close()
+
+	h := NewHubClient(server.URL)
+	meta, err := h.GetMetadata(context.Background(), "test-uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v", err)
+	}
+	if meta.MetricsEnabled != nil {
+		t.Fatalf("MetricsEnabled = %v, want nil for absent field", *meta.MetricsEnabled)
+	}
+}
+
+// TestGetMetadata_RefreshesInfrahubKeyOnUnauthorized verifies that GetMetadata
+// retries the request after a 401 triggers a successful key refresh
+// (mirrors the same test pattern used for SubmitBatch and Submit).
+func TestGetMetadata_RefreshesInfrahubKeyOnUnauthorized(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"metrics_enabled":true}`)
+	}))
+	defer server.Close()
+
+	h := NewHubClient(server.URL)
+	h.SetInfrahubKey("old-key")
+	h.KeyRefresher = func(_ context.Context) (string, error) {
+		return "new-key", nil
+	}
+
+	meta, err := h.GetMetadata(context.Background(), "test-uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v, want success after key refresh", err)
+	}
+	if meta == nil || meta.MetricsEnabled == nil || !*meta.MetricsEnabled {
+		t.Fatal("GetMetadata() returned unexpected metadata after key refresh")
+	}
+	if callCount != 2 {
+		t.Fatalf("server callCount = %d, want 2 (one 401 + one retry)", callCount)
+	}
+}

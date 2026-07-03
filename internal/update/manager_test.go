@@ -210,6 +210,102 @@ func TestCopyWithLimitAcceptsExactLimit(t *testing.T) {
 	}
 }
 
+// Fix 1: Check() must reject a release whose digest header is missing.
+func TestManagerCheckRejectsAbsentDigestHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(VersionHeaderName, "2.0.0")
+		// DigestHeaderName intentionally omitted
+		w.Header().Set("Location", "/binary")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	manager := NewManager(server.URL+"/download", "1.0.0")
+	release, err := manager.Check(context.Background())
+	if err == nil {
+		t.Fatal("Check() error = nil, want missing-digest error")
+	}
+	if release != nil {
+		t.Fatalf("Check() release = %+v, want nil on error", release)
+	}
+}
+
+// Fix 2: DownloadRelease must fail when the release carries an empty digest.
+func TestManagerDownloadReleaseRejectsEmptyDigest(t *testing.T) {
+	binary := []byte("#!/bin/sh\nexit 0\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(binary)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	currentPath := filepath.Join(dir, "hyperstack-agent")
+	if err := os.WriteFile(currentPath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	manager := NewManager(server.URL+"/download", "1.0.0")
+	release := &Release{
+		Version:     "2.0.0",
+		Digest:      "", // explicitly empty — verifyDigest must reject this
+		DownloadURL: server.URL,
+	}
+
+	if err := manager.DownloadRelease(context.Background(), release, currentPath); err == nil {
+		t.Fatal("DownloadRelease() error = nil, want digest-required error")
+	}
+	if release.StagedPath != "" {
+		t.Fatalf("release.StagedPath = %q, want empty on failure", release.StagedPath)
+	}
+}
+
+// Fix 5: isHigherVersion must skip the update silently (return false, nil)
+// when the current version is non-semver (e.g. "dev" or a git SHA).
+func TestIsHigherVersionDevCurrentSkipsUpdate(t *testing.T) {
+	cases := []string{"dev", "abc1234", "HEAD", ""}
+	for _, current := range cases {
+		got, err := isHigherVersion("1.0.0", current)
+		if err != nil {
+			t.Errorf("isHigherVersion(1.0.0, %q) error = %v, want nil", current, err)
+		}
+		if got {
+			t.Errorf("isHigherVersion(1.0.0, %q) = true, want false (dev build should skip)", current)
+		}
+	}
+}
+
+// Fix 5: an invalid next version from the server must still propagate as an error.
+func TestIsHigherVersionInvalidNextVersionErrors(t *testing.T) {
+	_, err := isHigherVersion("not-semver", "1.0.0")
+	if err == nil {
+		t.Fatal("isHigherVersion(not-semver, 1.0.0) error = nil, want parse error")
+	}
+}
+
+// Fix 4: resolveExecPath must reject a non-existent path.
+func TestResolveExecPathRejectsNonExistent(t *testing.T) {
+	_, err := resolveExecPath("/nonexistent/path/that/does/not/exist")
+	if err == nil {
+		t.Fatal("resolveExecPath() error = nil, want error for missing path")
+	}
+}
+
+// Fix 4: resolveExecPath must succeed for a real file and return an absolute path.
+func TestResolveExecPathResolvesRealFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "mybinary")
+	if err := os.WriteFile(p, []byte("data"), 0o755); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	resolved, err := resolveExecPath(p)
+	if err != nil {
+		t.Fatalf("resolveExecPath() error = %v", err)
+	}
+	if !filepath.IsAbs(resolved) {
+		t.Fatalf("resolveExecPath() = %q, want absolute path", resolved)
+	}
+}
+
 func digestFor(data []byte) string {
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("sha256:%x", sum)
