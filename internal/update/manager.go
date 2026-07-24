@@ -128,6 +128,25 @@ func (m *Manager) DownloadRelease(ctx context.Context, release *Release, current
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	// Handle redirects (3xx) by following Location header, since the HTTP client
+	// has CheckRedirect disabled to prevent auto-following in Check().
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			return fmt.Errorf("binary download returned redirect %s with no Location header", resp.Status)
+		}
+		// Follow the redirect with a new request
+		redirectReq, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
+		if err != nil {
+			return err
+		}
+		resp, err = m.Client.Do(redirectReq)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("binary download returned status %s", resp.Status)
 	}
