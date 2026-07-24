@@ -6,7 +6,7 @@ tmpdir="$(mktemp -d)"
 cd "$tmpdir"
 
 echo "ok" > healthz
-cp /usr/local/bin/hyperstack-agent download
+cp /opt/hyperstack-agent/bin/hyperstack-agent download
 
 sha256=$(sha256sum download | cut -d' ' -f1)
 digest="sha256:${sha256}"

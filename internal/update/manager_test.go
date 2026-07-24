@@ -112,20 +112,22 @@ func TestManagerDownloadReleaseAndPromote(t *testing.T) {
 		t.Fatalf("PromoteRelease() error = %v", err)
 	}
 
+	// New behavior: PromoteRelease stages to .new for systemd to swap, doesn't replace in-place
+	staged, err := os.ReadFile(currentPath + ".new")
+	if err != nil {
+		t.Fatalf("ReadFile(staged) error = %v", err)
+	}
+	if len(staged) == 0 {
+		t.Fatal("staged binary is empty")
+	}
+
+	// Current binary should still be the old one
 	got, err := os.ReadFile(currentPath)
 	if err != nil {
 		t.Fatalf("ReadFile(currentPath) error = %v", err)
 	}
-	if len(got) == 0 {
-		t.Fatal("current binary is empty")
-	}
-
-	backup, err := os.ReadFile(currentPath + ".bak")
-	if err != nil {
-		t.Fatalf("ReadFile(backup) error = %v", err)
-	}
-	if string(backup) != "old-binary" {
-		t.Fatalf("backup binary = %q, want %q", string(backup), "old-binary")
+	if string(got) != "old-binary" {
+		t.Fatalf("current binary = %q, want %q (should be unchanged until systemd swaps)", string(got), "old-binary")
 	}
 
 	if manager.CurrentVersion != "2.0.0" {
