@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --no-create-home --shell /usr/sbin/nologin hyperstack-agent
 
 WORKDIR /app
-COPY --from=builder /app/hyperstack-agent /usr/local/bin/hyperstack-agent
+COPY --from=builder /app/hyperstack-agent /opt/hyperstack-agent/bin/hyperstack-agent
 
 ENV AGENT_VERSION=${VERSION} \
     AGENT_BUILD_DATE=${DATE} \
@@ -41,7 +41,7 @@ COPY scripts /scripts
 RUN chmod 0755 /scripts/*.sh
 USER hyperstack-agent
 
-CMD ["/usr/local/bin/hyperstack-agent"]
+CMD ["/opt/hyperstack-agent/bin/hyperstack-agent"]
 
 FROM runtime-base AS agent
 USER hyperstack-agent
