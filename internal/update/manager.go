@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -222,12 +221,64 @@ func (m *Manager) PromoteRelease(currentPath string, release *Release) error {
 		return errors.New("release staged path is required")
 	}
 
-	if err := atomicSwap(currentPath, release.StagedPath); err != nil {
-		return err
+	// Stage the new binary as .new for ExecStartPre to swap on next restart.
+	// ExecStartPre will verify the binary, swap it atomically, and restore on failure.
+	stagedPath := currentPath + ".new"
+	if err := os.Rename(release.StagedPath, stagedPath); err != nil {
+		// If rename fails due to cross-device link (e.g., /tmp on different device),
+		// fall back to copying the file.
+		if !isExdev(err) {
+			return err
+		}
+		// Copy staged binary to .new
+		src, err := os.Open(release.StagedPath)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = src.Close() }()
+
+		dst, err := os.Create(stagedPath)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = dst.Close() }()
+
+		if _, err := io.Copy(dst, src); err != nil {
+			_ = os.Remove(stagedPath)
+			return err
+		}
+		if err := dst.Sync(); err != nil {
+			_ = os.Remove(stagedPath)
+			return err
+		}
+		// Make the staged binary executable
+		if err := os.Chmod(stagedPath, 0o755); err != nil {
+			_ = os.Remove(stagedPath)
+			return err
+		}
+		_ = os.Remove(release.StagedPath)
 	}
 
 	m.CurrentVersion = release.Version
 	return nil
+}
+
+// isExdev checks if an error is EXDEV (cross-device link).
+func isExdev(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for syscall.EXDEV directly
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.EXDEV
+	}
+	// Check in os.LinkError
+	if linkErr, ok := err.(*os.LinkError); ok {
+		if errno, ok := linkErr.Err.(syscall.Errno); ok {
+			return errno == syscall.EXDEV
+		}
+	}
+	return strings.Contains(err.Error(), "cross-device link") || strings.Contains(err.Error(), "invalid cross-device")
 }
 
 // resolveExecPath resolves symlinks and verifies the result is an absolute path.
@@ -243,42 +294,6 @@ func resolveExecPath(p string) (string, error) {
 		return "", fmt.Errorf("exec path is not absolute: %s", resolved)
 	}
 	return resolved, nil
-}
-
-// RestartProcess replaces the current process image with the binary at
-// currentPath using a clean exec(2). The path is resolved through symlinks
-// before the exec so the kernel receives a concrete, absolute path.
-func RestartProcess(currentPath string) error {
-	resolved, err := resolveExecPath(currentPath)
-	if err != nil {
-		return err
-	}
-	return syscall.Exec(resolved, os.Args, os.Environ()) /* #nosec G204 G702 -- resolved is the symlink-evaluated, absolute-asserted current executable path */
-}
-
-func atomicSwap(currentPath, newPath string) error {
-	backup := currentPath + ".bak"
-	_ = os.Remove(backup)
-	if err := copyFile(currentPath, backup); err != nil {
-		return err
-	}
-	// os.Rename is atomic on the same filesystem. When the staged binary lives
-	// in os.TempDir() and the install dir is on a different device (common in
-	// Docker / systemd setups), Rename returns EXDEV. Fall back to a copy+remove
-	// so the promote step still succeeds across filesystem boundaries.
-	if err := os.Rename(newPath, currentPath); err != nil {
-		// Cross-device rename (EXDEV) fallback: copyFile opens the destination
-		// with O_TRUNC, so currentPath is zeroed the moment the copy begins.
-		// If the copy fails, restore from the backup made above to avoid leaving
-		// the agent with a truncated (unlaunchable) binary.
-		if err2 := copyFile(newPath, currentPath); err2 != nil {
-			_ = copyFile(backup, currentPath) // best-effort restore
-			_ = os.Remove(newPath)
-			return err2
-		}
-		_ = os.Remove(newPath)
-	}
-	return nil
 }
 
 // Fix 2: verifyDigest now fails closed — an empty digest is treated as an
@@ -354,44 +369,6 @@ func smokeTestBinary(binaryPath string) error {
 	}
 
 	return err
-}
-
-func copyFile(src, dst string) error {
-	srcRoot, err := os.OpenRoot(filepath.Dir(src))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = srcRoot.Close() }()
-	in, err := srcRoot.Open(filepath.Base(src))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-
-	dstRoot, err := os.OpenRoot(filepath.Dir(dst))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = dstRoot.Close() }()
-	out, err := dstRoot.OpenFile(filepath.Base(dst), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := out.Close(); err != nil {
-			slog.Debug("copyFile: close destination failed", "dst", dst, "error", err)
-		}
-	}()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Sync()
 }
 
 // Fix 5: isHigherVersion treats a non-parseable current version (e.g. "dev",

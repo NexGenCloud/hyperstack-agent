@@ -250,18 +250,18 @@ func main() {
 
 			if restartRelease != nil && updater != nil && !externalShutdown {
 				if err := updater.PromoteRelease(executablePath, restartRelease); err != nil {
-					slog.Error("self-update promote failed", "version", restartRelease.Version, "error", err)
-					os.Exit(1)
-				}
-				slog.Info("restarting agent after self-update", "version", restartRelease.Version)
-				if err := update.RestartProcess(executablePath); err != nil {
-					slog.Error("self-update restart failed", "error", err)
-					os.Exit(1)
+					slog.Error("self-update stage failed", "version", restartRelease.Version, "error", err)
+					_ = os.Remove(restartRelease.StagedPath)
+				} else {
+					slog.Info("self-update staged; systemd will swap on restart", "version", restartRelease.Version)
+					slog.Info("Hyperstack agent shutdown complete")
+					// Exit 57: Self-update staged, systemd should restart to apply the staged binary swap
+					os.Exit(57)
 				}
 			} else if restartRelease != nil {
 				_ = os.Remove(restartRelease.StagedPath)
 				if externalShutdown {
-					slog.Info("self-update skipped because shutdown was requested", "version", restartRelease.Version)
+					slog.Info("self-update discarded due to shutdown request", "version", restartRelease.Version)
 				}
 			}
 			slog.Info("Hyperstack agent shutdown complete")
