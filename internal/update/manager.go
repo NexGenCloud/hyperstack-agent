@@ -237,7 +237,7 @@ func (m *Manager) PromoteRelease(currentPath string, release *Release) error {
 		}
 		defer func() { _ = src.Close() }()
 
-		dst, err := os.Create(stagedPath)
+		dst, err := os.Create(stagedPath) /* #nosec G304 -- stagedPath is currentPath + ".new" from os.Executable(), not user-supplied */
 		if err != nil {
 			return err
 		}
@@ -252,7 +252,7 @@ func (m *Manager) PromoteRelease(currentPath string, release *Release) error {
 			return err
 		}
 		// Make the staged binary executable
-		if err := os.Chmod(stagedPath, 0o755); err != nil {
+		if err := os.Chmod(stagedPath, 0o755); err != nil { /* #nosec G302 -- binary must be world-readable/executable */
 			_ = os.Remove(stagedPath)
 			return err
 		}
