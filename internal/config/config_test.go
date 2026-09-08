@@ -33,8 +33,8 @@ func TestLoad_DefaultInterval(t *testing.T) {
 
 func TestLoad_DedicatedInferenceDefaults(t *testing.T) {
 	cfg := Load()
-	if cfg.DedicatedInference.Endpoint != "http://localhost:8000/metrics" {
-		t.Fatalf("cfg.DedicatedInference.Endpoint = %q, want default localhost:8000/metrics", cfg.DedicatedInference.Endpoint)
+	if cfg.DedicatedInference.Endpoint != "http://127.0.0.1:8000/metrics" {
+		t.Fatalf("cfg.DedicatedInference.Endpoint = %q, want default 127.0.0.1:8000/metrics", cfg.DedicatedInference.Endpoint)
 	}
 	if cfg.DedicatedInference.ScrapeInterval.String() != "15s" {
 		t.Fatalf("cfg.DedicatedInference.ScrapeInterval = %v, want 15s", cfg.DedicatedInference.ScrapeInterval)

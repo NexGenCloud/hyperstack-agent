@@ -61,7 +61,7 @@ func Load() Config {
 			ScrapeInterval: 30 * time.Second,
 		},
 		DedicatedInference: DedicatedInferenceConfig{
-			Endpoint:       getEnv("HYPERSTACK_DEDICATED_INFERENCE_URL", "http://localhost:8000/metrics"),
+			Endpoint:       getEnv("HYPERSTACK_DEDICATED_INFERENCE_URL", "http://127.0.0.1:8000/metrics"),
 			ScrapeInterval: 15 * time.Second,
 		},
 	}
