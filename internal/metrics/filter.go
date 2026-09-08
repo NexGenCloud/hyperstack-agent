@@ -33,6 +33,8 @@ var ImportantPrefixes = []string{
 	"nvidia_gpu_",
 	"nvidia_smi_",
 	"gpu_",
+	// Dedicated Inference (vLLM)
+	"hyperstack_dedicated_inference_",
 }
 
 // FilterSamples applies the important prefix filter and returns the subset of samples.

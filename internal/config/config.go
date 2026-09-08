@@ -25,13 +25,22 @@ type ExporterConfig struct {
 	ScrapeInterval time.Duration
 }
 
+// DedicatedInferenceConfig has no Enable field: whether to actually scrape is
+// decided at runtime by the gateway (VMMetadata.DedicatedInference), not by
+// local config, since the agent has no local way to detect it.
+type DedicatedInferenceConfig struct {
+	Endpoint       string
+	ScrapeInterval time.Duration
+}
+
 // Config holds environment-driven settings for the agent.
 type Config struct {
 	Hub             HubConfig
 	DefaultInterval time.Duration
 
-	Node ExporterConfig
-	GPU  ExporterConfig
+	Node               ExporterConfig
+	GPU                ExporterConfig
+	DedicatedInference DedicatedInferenceConfig
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -50,6 +59,10 @@ func Load() Config {
 		GPU: ExporterConfig{
 			Enable:         getEnvBool("HYPERSTACK_ENABLE_GPU", true),
 			ScrapeInterval: 30 * time.Second,
+		},
+		DedicatedInference: DedicatedInferenceConfig{
+			Endpoint:       getEnv("HYPERSTACK_DEDICATED_INFERENCE_URL", "http://localhost:8000/metrics"),
+			ScrapeInterval: 15 * time.Second,
 		},
 	}
 }

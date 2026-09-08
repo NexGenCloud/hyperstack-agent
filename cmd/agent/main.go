@@ -160,10 +160,25 @@ func main() {
 		slog.Info("gpu collector skipped", "reason", "disabled")
 	}
 
+	// Dedicated Inference is always scheduled: whether this VM actually runs
+	// vLLM is a fact the gateway knows (from the cloud provider API), not
+	// something the agent can detect locally, so the collector starts gated
+	// off and is flipped on by runMetricsEnabledSyncLoop once confirmed.
+	vllmCollector := &collectors.VLLMCollector{
+		Hub:   hub,
+		Probe: probes.VLLMProbe{Endpoint: cfg.DedicatedInference.Endpoint},
+	}
+	scheduled = append(scheduled, collectors.ScheduledCollector{
+		Collector: vllmCollector,
+		Interval:  cfg.DedicatedInference.ScrapeInterval,
+	})
+	slog.Info("dedicated inference collector scheduled", "endpoint", cfg.DedicatedInference.Endpoint, "interval", cfg.DedicatedInference.ScrapeInterval)
+
 	enabledCollectors := map[string]bool{
-		"agent": true,
-		"gpu":   gpuCollectorEnabled,
-		"node":  cfg.Node.Enable,
+		"agent":               true,
+		"gpu":                 gpuCollectorEnabled,
+		"node":                cfg.Node.Enable,
+		"dedicated_inference": true,
 	}
 	scheduled = append(scheduled, collectors.ScheduledCollector{
 		Collector: &collectors.AgentCollector{
@@ -194,7 +209,7 @@ func main() {
 		// an explicit false from the gateway preserves that contract. Starting
 		// disabled is risky: any first-sync failure (network blip, missing field,
 		// gateway rollout) would leave collectors permanently off.
-		go runMetricsEnabledSyncLoop(ctx, hub, mgr, meta.UUID, len(scheduled), metricsConfigSyncInterval)
+		go runMetricsEnabledSyncLoop(ctx, hub, mgr, vllmCollector, meta.UUID, len(scheduled), metricsConfigSyncInterval)
 	}
 
 	managerErrCh := make(chan error, 1)
@@ -281,6 +296,7 @@ func runMetricsEnabledSyncLoop(
 	ctx context.Context,
 	hub *client.HubClient,
 	manager *collectors.Manager,
+	vllmCollector *collectors.VLLMCollector,
 	uuid string,
 	collectorCount int,
 	interval time.Duration,
@@ -291,6 +307,8 @@ func runMetricsEnabledSyncLoop(
 
 	lastEnabled := true
 	hasLastEnabled := false
+	lastDIEnabled := false
+	hasLastDIEnabled := false
 	sync := func() {
 		syncCtx, cancel := context.WithTimeout(ctx, metricsConfigSyncTimeout)
 		metadata, err := hub.GetMetadata(syncCtx, uuid)
@@ -322,6 +340,23 @@ func runMetricsEnabledSyncLoop(
 			}
 			lastEnabled = enabled
 			hasLastEnabled = true
+		}
+
+		// DedicatedInference is a fact about the VM, not a toggle: a nil
+		// Capabilities (no enrichment data) means "not a Dedicated Inference
+		// VM", the opposite default direction from MetricsEnabled above.
+		isDI := metadata.Capabilities != nil && metadata.Capabilities.DedicatedInference
+		if vllmCollector != nil {
+			vllmCollector.SetEnabled(isDI)
+		}
+		if !hasLastDIEnabled || lastDIEnabled != isDI {
+			if isDI {
+				slog.Info("dedicated inference confirmed; collector active", "uuid", uuid)
+			} else {
+				slog.Info("dedicated inference not present; collector idle", "uuid", uuid)
+			}
+			lastDIEnabled = isDI
+			hasLastDIEnabled = true
 		}
 	}
 

@@ -54,6 +54,8 @@ func (m *Manager) Run(ctx context.Context) error {
 			collectorName = "gpu"
 		case *AgentCollector:
 			collectorName = "agent"
+		case *VLLMCollector:
+			collectorName = "dedicated_inference"
 		}
 		go func() {
 			slog.Debug("collector starting", "collector", collectorName, "interval", interval.String())

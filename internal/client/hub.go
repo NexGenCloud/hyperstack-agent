@@ -718,6 +718,23 @@ func closeResponseBody(resp *http.Response, operation string) {
 // dropped field silently disable all collectors.
 type VMMetadata struct {
 	MetricsEnabled *bool `json:"metrics_enabled"`
+
+	// Capabilities is only present when the gateway was able to enrich this
+	// VM from Hyperstack (vm.enhanced_metrics). A nil Capabilities means no
+	// enrichment data is available; callers should treat every field within
+	// it as its zero value in that case, not as "default enabled".
+	Capabilities *VMMetadataCapabilities `json:"capabilities"`
+}
+
+// VMMetadataCapabilities holds enrichment-derived facts about what a VM is
+// provisioned for.
+type VMMetadataCapabilities struct {
+	// DedicatedInference reports whether this VM was provisioned as a
+	// Hyperstack Dedicated Inference (vLLM) instance. Unlike MetricsEnabled,
+	// this is a fact about the VM rather than a toggle: when Capabilities is
+	// nil, or this is false, callers should treat it as "not a Dedicated
+	// Inference VM".
+	DedicatedInference bool `json:"dedicated_inference"`
 }
 
 func (h *HubClient) GetMetadata(ctx context.Context, uuid string) (*VMMetadata, error) {
