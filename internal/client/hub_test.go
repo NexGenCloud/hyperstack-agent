@@ -1004,6 +1004,46 @@ func TestGetMetadata_MissingFieldIsNil(t *testing.T) {
 	}
 }
 
+// TestGetMetadata_CapabilitiesDedicatedInferenceTrue verifies that a nested
+// capabilities.dedicated_inference:true is decoded correctly.
+func TestGetMetadata_CapabilitiesDedicatedInferenceTrue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"capabilities":{"dedicated_inference":true}}`)
+	}))
+	defer server.Close()
+
+	h := NewHubClient(server.URL)
+	meta, err := h.GetMetadata(context.Background(), "test-uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v", err)
+	}
+	if meta.Capabilities == nil || !meta.Capabilities.DedicatedInference {
+		t.Fatalf("Capabilities = %v, want DedicatedInference = true", meta.Capabilities)
+	}
+}
+
+// TestGetMetadata_CapabilitiesMissingFieldIsNil verifies that a response
+// without a capabilities object leaves the field nil, distinguishable from an
+// enriched-but-false response. Unlike MetricsEnabled, nil must be treated as
+// "not a Dedicated Inference VM" by callers, not as default-enabled.
+func TestGetMetadata_CapabilitiesMissingFieldIsNil(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{}`)
+	}))
+	defer server.Close()
+
+	h := NewHubClient(server.URL)
+	meta, err := h.GetMetadata(context.Background(), "test-uuid")
+	if err != nil {
+		t.Fatalf("GetMetadata() error = %v", err)
+	}
+	if meta.Capabilities != nil {
+		t.Fatalf("Capabilities = %v, want nil for absent field", meta.Capabilities)
+	}
+}
+
 // TestGetMetadata_RefreshesHyperstackKeyOnUnauthorized verifies that GetMetadata
 // retries the request after a 401 triggers a successful key refresh
 // (mirrors the same test pattern used for SubmitBatch and Submit).

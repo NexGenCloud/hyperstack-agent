@@ -31,6 +31,24 @@ func TestLoad_DefaultInterval(t *testing.T) {
 	}
 }
 
+func TestLoad_DedicatedInferenceDefaults(t *testing.T) {
+	cfg := Load()
+	if cfg.DedicatedInference.Endpoint != "http://127.0.0.1:8000/metrics" {
+		t.Fatalf("cfg.DedicatedInference.Endpoint = %q, want default 127.0.0.1:8000/metrics", cfg.DedicatedInference.Endpoint)
+	}
+	if cfg.DedicatedInference.ScrapeInterval.String() != "15s" {
+		t.Fatalf("cfg.DedicatedInference.ScrapeInterval = %v, want 15s", cfg.DedicatedInference.ScrapeInterval)
+	}
+}
+
+func TestLoad_DedicatedInferenceEndpointOverride(t *testing.T) {
+	t.Setenv("HYPERSTACK_DEDICATED_INFERENCE_URL", "http://localhost:9000/metrics")
+	cfg := Load()
+	if cfg.DedicatedInference.Endpoint != "http://localhost:9000/metrics" {
+		t.Fatalf("cfg.DedicatedInference.Endpoint = %q, want override", cfg.DedicatedInference.Endpoint)
+	}
+}
+
 func TestSecurityWarningsWarnsForNonLoopbackHTTPHub(t *testing.T) {
 	cfg := Config{Hub: HubConfig{URL: "http://gateway.example.com"}}
 
